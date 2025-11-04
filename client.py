@@ -1,31 +1,16 @@
 #!/usr/bin/env python3
 """
-client.py — Split Learning over Ray with Board + Config + Run Folders
----------------------------------------------------------------------
+client.py — Split Learning over Ray with Board, Metrics, and Toy Encryption
+---------------------------------------------------------------------------
 
 Topology:
 
   [PeerM1M3]  <-->  [Board]  <-->  [PeerM2]
 
-- Multiple PeerM1M3 actors (each with its own M1 + M3 + data shard)
-- Multiple PeerM2 actors (each with its own M2)
-- All communication is via the Board actor using message objects:
-    kind: "fwd_req" | "fwd_res" | "bwd_req" | "bwd_res" | "infer_req" | "infer_res"
-    msg_id: unique UUID
-    session_id: training step identifier
-    sender / receiver: peer names
-    payload: numpy array
-    timestamp: float
-
-Logging:
-- Each run has its own folder: runs/run_YYYYmmdd_HHMMSS/
-- Global log: global.log
-- Board log: board.log
-- Per-peer logs: <peer_name>.log
-
-Configured via config.yaml.
-
-Author: you & GPT
+Additions:
+- Per-client CSV metrics for plotting (metrics_<client>.csv)
+- Payload abstraction via encode_tensor / decode_tensor
+- Simple symmetric XOR "encryption" controlled via per-M2 keys in config.yaml
 """
 
 import os
@@ -37,6 +22,7 @@ import uuid
 import logging
 from datetime import datetime
 from collections import defaultdict
+import io
 
 import numpy as np
 import tensorflow as tf
@@ -92,7 +78,56 @@ def setup_peer_logger(peer_name: str, run_dir: str, level: str = "INFO") -> logg
 
 
 # ============================================================
-# 2. Models: M1, M2, M3
+# 2. Payload encoding / "encryption"
+# ============================================================
+
+def tensor_to_bytes(arr: np.ndarray) -> bytes:
+    """Serialize a NumPy array to bytes (shape + dtype preserved)."""
+    buf = io.BytesIO()
+    np.save(buf, arr, allow_pickle=False)
+    return buf.getvalue()
+
+
+def bytes_to_tensor(b: bytes) -> np.ndarray:
+    """Deserialize bytes back into a NumPy array."""
+    buf = io.BytesIO(b)
+    return np.load(buf, allow_pickle=False)
+
+
+def xor_bytes(data: bytes, key: bytes) -> bytes:
+    """Simple XOR-based symmetric 'encryption'."""
+    if not key:
+        return data
+    key_len = len(key)
+    return bytes(d ^ key[i % key_len] for i, d in enumerate(data))
+
+
+def encode_tensor(arr: np.ndarray, key_str: str | None) -> bytes:
+    """
+    Serialize + (optionally) XOR-encrypt a tensor.
+
+    If key_str is None or empty, we still serialize but skip XOR.
+    """
+    raw = tensor_to_bytes(arr)
+    if not key_str:
+        return raw
+    key = key_str.encode("utf-8")
+    return xor_bytes(raw, key)
+
+
+def decode_tensor(blob: bytes, key_str: str | None) -> np.ndarray:
+    """
+    Reverse of encode_tensor: XOR-decrypt (if key available) + deserialize.
+    """
+    if not key_str:
+        return bytes_to_tensor(blob)
+    key = key_str.encode("utf-8")
+    raw = xor_bytes(blob, key)
+    return bytes_to_tensor(raw)
+
+
+# ============================================================
+# 3. Models: M1, M2, M3
 # ============================================================
 
 def build_M1(input_shape=(28, 28, 1)) -> keras.Model:
@@ -122,7 +157,7 @@ def build_M3(input_dim=64, num_classes=10) -> keras.Model:
 
 
 # ============================================================
-# 3. Data utilities
+# 4. Data utilities
 # ============================================================
 
 def load_mnist(normalize=True):
@@ -142,7 +177,7 @@ def batch_accuracy(y_true, y_pred):
 
 
 # ============================================================
-# 4. Board actor
+# 5. Board actor
 # ============================================================
 
 @ray.remote
@@ -155,8 +190,10 @@ class Board:
       - receiver (peer name)
 
     API:
-      post_message(kind, sender, receiver, session_id, payload) -> msg_id
+      post_message(kind, sender, receiver, session_id, payload_bytes) -> msg_id
       poll_message(kind, receiver, session_id=None) -> message | None
+
+    NOTE: payload is opaque bytes; Board doesn't know if it's encrypted.
     """
 
     def __init__(
@@ -181,7 +218,7 @@ class Board:
             f"Board initialized with verbose={self.verbose}, log_every={self.log_every}"
         )
 
-    def post_message(self, kind: str, sender: str, receiver: str, session_id: str, payload: np.ndarray) -> str:
+    def post_message(self, kind: str, sender: str, receiver: str, session_id: str, payload: bytes) -> str:
         """Store a message and return its msg_id."""
         self._post_count += 1
         msg_id = uuid.uuid4().hex
@@ -191,16 +228,16 @@ class Board:
             "sender": sender,
             "receiver": receiver,
             "session_id": session_id,
-            "payload": payload,
+            "payload": payload,   # opaque bytes
             "timestamp": time.time(),
         }
         self.queues[kind][receiver].append(message)
 
         if self.verbose and (self._post_count % self.log_every == 0):
-            shape = getattr(payload, "shape", None)
+            size = len(payload)
             self.logger.info(
                 f"[POST #{self._post_count}] kind={kind} sender={sender} "
-                f"receiver={receiver} session={session_id} shape={shape} msg_id={msg_id}"
+                f"receiver={receiver} session={session_id} size={size}B msg_id={msg_id}"
             )
 
         return msg_id
@@ -236,17 +273,17 @@ class Board:
             msg = msgs.pop(idx)
 
         if self.verbose and (self._poll_count % self.log_every == 0):
-            shape = getattr(msg["payload"], "shape", None)
+            size = len(msg["payload"])
             self.logger.info(
                 f"[POLL #{self._poll_count}] kind={kind} receiver={receiver} "
-                f"session={msg['session_id']} msg_id={msg['msg_id']} shape={shape}"
+                f"session={msg['session_id']} msg_id={msg['msg_id']} size={size}B"
             )
 
         return msg
 
 
 # ============================================================
-# 5. Ray peer: M2 holder
+# 6. Ray peer: M2 holder
 # ============================================================
 
 @ray.remote
@@ -257,13 +294,14 @@ class PeerM2:
     It does NOT get called directly by clients.
     Instead, it runs a loop where it:
 
-      - polls the Board for fwd_req (from any M1M3)
+      - polls the Board for fwd_req
       - computes z_mid, caches tape and z_cut
-      - posts fwd_res back to the Board
+      - posts fwd_res
       - polls the Board for bwd_req
-      - computes grads, updates M2, posts bwd_res back
+      - computes grads, updates M2, posts bwd_res
+      - polls the Board for infer_req / posts infer_res
 
-    It also handles infer_req / infer_res for evaluation.
+    All payloads are encoded/decoded using a shared_key (simple XOR).
     """
 
     def __init__(
@@ -273,6 +311,7 @@ class PeerM2:
         board,
         input_dim: int = 128,
         lr: float = 1e-3,
+        shared_key: str | None = None,
         log_level: str = "INFO",
         verbose: bool = False,
         log_every: int = 50,
@@ -285,6 +324,7 @@ class PeerM2:
         self.opt_M2 = optimizers.Adam(learning_rate=lr)
         self._sessions = {}  # session_id -> (tape, z_cut, z_mid)
 
+        self.shared_key = shared_key or ""
         self.verbose = verbose
         self.log_every = max(1, int(log_every))
         self._fwd_count = 0
@@ -293,16 +333,14 @@ class PeerM2:
 
         self.logger.info(
             f"Initialized PeerM2 with input_dim={input_dim}, lr={lr}, "
-            f"verbose={self.verbose}, log_every={self.log_every}"
+            f"verbose={self.verbose}, log_every={self.log_every}, "
+            f"shared_key_len={len(self.shared_key)}"
         )
 
     # ---------------- main processing loop ----------------
 
     def run(self):
-        """
-        Main loop: process fwd_req, bwd_req, infer_req from the Board.
-        This is intended to run "forever" (until Ray shuts down).
-        """
+        """Main loop: process fwd_req, bwd_req, infer_req from the Board."""
         self.logger.info("PeerM2.run() loop started.")
         while True:
             handled = False
@@ -339,8 +377,10 @@ class PeerM2:
     def _handle_forward(self, msg: dict):
         self._fwd_count += 1
         session_id = msg["session_id"]
-        z_cut_np = msg["payload"]
         sender = msg["sender"]
+
+        # decode tensor
+        z_cut_np = decode_tensor(msg["payload"], self.shared_key)
 
         z_cut = tf.convert_to_tensor(z_cut_np, dtype=tf.float32)
         with tf.GradientTape() as tape:
@@ -350,13 +390,14 @@ class PeerM2:
         self._sessions[session_id] = (tape, z_cut, z_mid)
         z_mid_np = z_mid.numpy()
 
-        # send response
+        # encode response
+        payload = encode_tensor(z_mid_np, self.shared_key)
         ray.get(self.board.post_message.remote(
             "fwd_res",
             sender=self.name,
             receiver=sender,
             session_id=session_id,
-            payload=z_mid_np,
+            payload=payload,
         ))
 
         if self.verbose and (self._fwd_count % self.log_every == 0):
@@ -370,12 +411,14 @@ class PeerM2:
     def _handle_backward(self, msg: dict):
         self._bwd_count += 1
         session_id = msg["session_id"]
-        dL_dz_mid_np = msg["payload"]
         sender = msg["sender"]
 
         if session_id not in self._sessions:
             self.logger.error(f"[BWD] no cached forward for session={session_id}")
             return
+
+        # decode tensor
+        dL_dz_mid_np = decode_tensor(msg["payload"], self.shared_key)
 
         tape, z_cut, z_mid = self._sessions.pop(session_id)
 
@@ -388,12 +431,13 @@ class PeerM2:
         self.opt_M2.apply_gradients(zip(grads_M2, self.M2.trainable_variables))
         dL_dz_cut_np = dL_dz_cut.numpy()
 
+        payload = encode_tensor(dL_dz_cut_np, self.shared_key)
         ray.get(self.board.post_message.remote(
             "bwd_res",
             sender=self.name,
             receiver=sender,
             session_id=session_id,
-            payload=dL_dz_cut_np,
+            payload=payload,
         ))
 
         if self.verbose and (self._bwd_count % self.log_every == 0):
@@ -407,19 +451,21 @@ class PeerM2:
     def _handle_infer(self, msg: dict):
         self._infer_count += 1
         session_id = msg["session_id"]
-        z_cut_np = msg["payload"]
         sender = msg["sender"]
+
+        z_cut_np = decode_tensor(msg["payload"], self.shared_key)
 
         z_cut = tf.convert_to_tensor(z_cut_np, dtype=tf.float32)
         z_mid = self.M2(z_cut, training=False)
         z_mid_np = z_mid.numpy()
 
+        payload = encode_tensor(z_mid_np, self.shared_key)
         ray.get(self.board.post_message.remote(
             "infer_res",
             sender=self.name,
             receiver=sender,
             session_id=session_id,
-            payload=z_mid_np,
+            payload=payload,
         ))
 
         if self.verbose and (self._infer_count % self.log_every == 0):
@@ -430,7 +476,7 @@ class PeerM2:
 
 
 # ============================================================
-# 6. Ray peer: M1+M3 client
+# 7. Ray peer: M1+M3 client
 # ============================================================
 
 @ray.remote
@@ -442,7 +488,8 @@ class PeerM1M3:
     - Holds its own local training shard.
     - Knows:
         - the Board actor
-        - the target M2 peer name (string)
+        - the target M2 peer name
+        - the shared_key used to encode/decode tensors
     """
 
     def __init__(
@@ -455,6 +502,7 @@ class PeerM1M3:
         y_test: np.ndarray,
         board,
         target_m2: str,
+        shared_key: str | None = None,
         epochs: int = 3,
         batch_size: int = 128,
         lr: float = 1e-3,
@@ -481,15 +529,22 @@ class PeerM1M3:
         self.opt_M3 = optimizers.Adam(learning_rate=lr)
         self.loss_fn = losses.SparseCategoricalCrossentropy()
 
+        self.shared_key = shared_key or ""
         self.verbose = verbose
         self.log_every = max(1, int(log_every))
         self._fwd_count = 0
         self._bwd_count = 0
         self._infer_count = 0
 
+        # metrics CSV
+        self.metrics_path = os.path.join(run_dir, f"metrics_{self.name}.csv")
+        with open(self.metrics_path, "w") as f:
+            f.write("epoch,step,loss,acc\n")
+
         self.logger.info(
             f"Initialized PeerM1M3 epochs={epochs} batch_size={batch_size} lr={lr} "
-            f"target_m2={target_m2} verbose={self.verbose} log_every={self.log_every}"
+            f"target_m2={target_m2} verbose={self.verbose} log_every={self.log_every} "
+            f"shared_key_len={len(self.shared_key)}"
         )
 
     # ---------------- training ----------------
@@ -522,12 +577,13 @@ class PeerM1M3:
 
                 # ----- send forward request to Board -----
                 self._fwd_count += 1
+                payload = encode_tensor(z_cut_np, self.shared_key)
                 ray.get(self.board.post_message.remote(
                     "fwd_req",
                     sender=self.name,
                     receiver=self.target_m2,
                     session_id=session_id,
-                    payload=z_cut_np,
+                    payload=payload,
                 ))
                 if self.verbose and (self._fwd_count % self.log_every == 0):
                     self.logger.info(
@@ -544,7 +600,7 @@ class PeerM1M3:
                         session_id=session_id,
                     ))
                     if msg is not None:
-                        z_mid_np = msg["payload"]
+                        z_mid_np = decode_tensor(msg["payload"], self.shared_key)
                         if self.verbose and (self._fwd_count % self.log_every == 0):
                             self.logger.info(
                                 f"[FWD_RES #{self._fwd_count}] session={session_id} "
@@ -570,12 +626,13 @@ class PeerM1M3:
                 # ----- send backward request (dL/dz_mid) -----
                 self._bwd_count += 1
                 dL_dz_mid_np = dL_dz_mid.numpy()
+                payload = encode_tensor(dL_dz_mid_np, self.shared_key)
                 ray.get(self.board.post_message.remote(
                     "bwd_req",
                     sender=self.name,
                     receiver=self.target_m2,
                     session_id=session_id,
-                    payload=dL_dz_mid_np,
+                    payload=payload,
                 ))
                 if self.verbose and (self._bwd_count % self.log_every == 0):
                     self.logger.info(
@@ -592,7 +649,7 @@ class PeerM1M3:
                         session_id=session_id,
                     ))
                     if msg is not None:
-                        dL_dz_cut_np = msg["payload"]
+                        dL_dz_cut_np = decode_tensor(msg["payload"], self.shared_key)
                         if self.verbose and (self._bwd_count % self.log_every == 0):
                             self.logger.info(
                                 f"[BWD_RES #{self._bwd_count}] session={session_id} "
@@ -612,13 +669,18 @@ class PeerM1M3:
 
                 # ----- metrics -----
                 acc_batch = batch_accuracy(yb.numpy(), logits.numpy())
-                epoch_losses.append(float(loss_value.numpy()))
+                loss_val = float(loss_value.numpy())
+                epoch_losses.append(loss_val)
                 epoch_accs.append(acc_batch)
+
+                # write CSV row
+                with open(self.metrics_path, "a") as f:
+                    f.write(f"{epoch},{step},{loss_val},{acc_batch}\n")
 
                 if step % 100 == 0:
                     self.logger.info(
                         f"Epoch {epoch} Step {step}/{steps_per_epoch} "
-                        f"Loss={epoch_losses[-1]:.4f} Acc={acc_batch:.4f}"
+                        f"Loss={loss_val:.4f} Acc={acc_batch:.4f}"
                     )
 
             mean_loss = float(np.mean(epoch_losses))
@@ -648,12 +710,13 @@ class PeerM1M3:
 
             # send infer request
             self._infer_count += 1
+            payload = encode_tensor(z_cut_np, self.shared_key)
             ray.get(self.board.post_message.remote(
                 "infer_req",
                 sender=self.name,
                 receiver=self.target_m2,
                 session_id=session_id,
-                payload=z_cut_np,
+                payload=payload,
             ))
             if self.verbose and (self._infer_count % self.log_every == 0):
                 self.logger.info(
@@ -670,7 +733,7 @@ class PeerM1M3:
                     session_id=session_id,
                 ))
                 if msg is not None:
-                    z_mid_np = msg["payload"]
+                    z_mid_np = decode_tensor(msg["payload"], self.shared_key)
                     if self.verbose and (self._infer_count % self.log_every == 0):
                         self.logger.info(
                             f"[INFER_RES #{self._infer_count}] session={session_id} "
@@ -690,7 +753,7 @@ class PeerM1M3:
 
 
 # ============================================================
-# 7. Main with config + run folder + suppression flag
+# 8. Main with config + run folder + suppression flag
 # ============================================================
 
 def main(config_path: str = "config.yaml"):
@@ -756,6 +819,13 @@ def main(config_path: str = "config.yaml"):
     n_clients = len(m1m3_peers_cfg)
     global_logger.info(f"Configured {n_clients} M1M3 peers and {len(m2_peers_cfg)} M2 peers.")
 
+    # ---- Build mapping from M2 name -> key ----
+    m2_keys: dict[str, str] = {}
+    for m2_cfg in m2_peers_cfg:
+        name = m2_cfg["name"]
+        key = m2_cfg.get("key", "") or ""
+        m2_keys[name] = key
+
     # ---- Board actor ----
     board = Board.remote(
         name="board",
@@ -774,18 +844,20 @@ def main(config_path: str = "config.yaml"):
     m2_peers = {}
     for m2_cfg in m2_peers_cfg:
         name = m2_cfg["name"]
+        key = m2_keys.get(name, "")
         m2_peer = PeerM2.remote(
             name=name,
             run_dir=run_dir,
             board=board,
             input_dim=128,
             lr=lr,
+            shared_key=key,
             log_level=log_level,
             verbose=m2_verbose,
             log_every=m2_log_every,
         )
         m2_peers[name] = m2_peer
-        global_logger.info(f"Spawned M2 peer: {name}")
+        global_logger.info(f"Spawned M2 peer: {name} (key_len={len(key)})")
 
     # Launch M2 processing loops (fire-and-forget)
     for name, m2_peer in m2_peers.items():
@@ -800,6 +872,7 @@ def main(config_path: str = "config.yaml"):
         if target_m2 not in m2_peers:
             raise ValueError(f"M1M3 peer {name} references unknown M2 peer '{target_m2}'")
 
+        key = m2_keys.get(target_m2, "")
         client = PeerM1M3.remote(
             name=name,
             run_dir=run_dir,
@@ -809,6 +882,7 @@ def main(config_path: str = "config.yaml"):
             y_test=y_test,
             board=board,
             target_m2=target_m2,
+            shared_key=key,
             epochs=epochs,
             batch_size=batch_size,
             lr=lr,
@@ -817,7 +891,9 @@ def main(config_path: str = "config.yaml"):
             log_every=m1m3_log_every,
         )
         clients.append(client)
-        global_logger.info(f"Spawned M1M3 peer: {name} → bound to M2 peer: {target_m2}")
+        global_logger.info(
+            f"Spawned M1M3 peer: {name} → bound to M2 peer: {target_m2} (key_len={len(key)})"
+        )
 
     # Train all clients
     global_logger.info("Starting training for all clients...")

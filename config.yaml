@@ -1,6 +1,6 @@
 run:
   base_dir: "runs"
-  name: null          # or "board_experiment_01"
+  name: null          # or "board_crypto_experiment"
 
 general:
   epochs: 2
@@ -22,7 +22,9 @@ general:
 peers:
   M2:
     - name: "m2_a"
+      key: "secret_a"
     - name: "m2_b"
+      key: "secret_b"
 
   M1M3:
     - name: "client_1"
