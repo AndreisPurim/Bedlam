@@ -1,15 +1,14 @@
 run:
   base_dir: "runs"
-  name: null          # or "board_crypto_experiment"
+  name: null
 
 general:
-  epochs: 2
+  epochs: 3
   batch_size: 128
   lr: 0.001
   suppress_warnings: true
   log_level: "INFO"
 
-  # verbosity
   m2_verbose: true
   m2_log_every: 50
 
@@ -22,9 +21,9 @@ general:
 peers:
   M2:
     - name: "m2_a"
-      key: "secret_a"
+      key: "super_secret_m2_a_key"
     - name: "m2_b"
-      key: "secret_b"
+      key: "super_secret_m2_b_key"
 
   M1M3:
     - name: "client_1"
