@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
 """
-client.py — Split Learning over Ray with Config + Run Folders
--------------------------------------------------------------
+client.py — Split Learning over Ray with Board + Config + Run Folders
+---------------------------------------------------------------------
+
+Topology:
+
+  [PeerM1M3]  <-->  [Board]  <-->  [PeerM2]
 
 - Multiple PeerM1M3 actors (each with its own M1 + M3 + data shard)
 - Multiple PeerM2 actors (each with its own M2)
-- Each M1M3 peer is bound (via config) to one M2 peer.
-- All communication via Ray (no gRPC / board yet).
+- All communication is via the Board actor using message objects:
+    kind: "fwd_req" | "fwd_res" | "bwd_req" | "bwd_res" | "infer_req" | "infer_res"
+    msg_id: unique UUID
+    session_id: training step identifier
+    sender / receiver: peer names
+    payload: numpy array
+    timestamp: float
 
 Logging:
 - Each run has its own folder: runs/run_YYYYmmdd_HHMMSS/
 - Global log: global.log
+- Board log: board.log
 - Per-peer logs: <peer_name>.log
 
 Configured via config.yaml.
+
+Author: you & GPT
 """
 
 import os
@@ -23,13 +35,15 @@ os.environ["CUDA_VISIBLE_DEVICES"] = ""       # force CPU use
 import time
 import uuid
 import logging
+from datetime import datetime
+from collections import defaultdict
+
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from keras import layers, models, losses, optimizers
 import ray
 import yaml
-from datetime import datetime
 
 
 # ============================================================
@@ -60,13 +74,13 @@ def setup_global_logger(run_dir: str, level: str = "INFO") -> logging.Logger:
 
 def setup_peer_logger(peer_name: str, run_dir: str, level: str = "INFO") -> logging.Logger:
     """
-    Logger dedicated to a peer. Logs only to its own file:
+    Logger dedicated to a peer (or the board). Logs only to its own file:
       runs/run_xxxx/<peer_name>.log
     """
     logger = logging.getLogger(peer_name)
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     logger.handlers.clear()
-    logger.propagate = False  # don’t bubble up to root to avoid duplicates
+    logger.propagate = False  # don’t bubble to root (avoid duplicates)
 
     fmt = logging.Formatter(f"[{peer_name}] %(asctime)s %(levelname)s %(message)s")
 
@@ -128,7 +142,111 @@ def batch_accuracy(y_true, y_pred):
 
 
 # ============================================================
-# 4. Ray peer: M2 holder
+# 4. Board actor
+# ============================================================
+
+@ray.remote
+class Board:
+    """
+    Central message board.
+
+    Messages are stored in queues keyed by:
+      - kind (fwd_req, fwd_res, bwd_req, bwd_res, infer_req, infer_res)
+      - receiver (peer name)
+
+    API:
+      post_message(kind, sender, receiver, session_id, payload) -> msg_id
+      poll_message(kind, receiver, session_id=None) -> message | None
+    """
+
+    def __init__(
+        self,
+        name: str,
+        run_dir: str,
+        log_level: str = "INFO",
+        verbose: bool = False,
+        log_every: int = 100,
+    ):
+        self.name = name
+        self.logger = setup_peer_logger(name, run_dir, log_level)
+        self.verbose = verbose
+        self.log_every = max(1, int(log_every))
+        self._post_count = 0
+        self._poll_count = 0
+
+        # queues[kind][receiver] = [message, ...]
+        self.queues = defaultdict(lambda: defaultdict(list))
+
+        self.logger.info(
+            f"Board initialized with verbose={self.verbose}, log_every={self.log_every}"
+        )
+
+    def post_message(self, kind: str, sender: str, receiver: str, session_id: str, payload: np.ndarray) -> str:
+        """Store a message and return its msg_id."""
+        self._post_count += 1
+        msg_id = uuid.uuid4().hex
+        message = {
+            "msg_id": msg_id,
+            "kind": kind,
+            "sender": sender,
+            "receiver": receiver,
+            "session_id": session_id,
+            "payload": payload,
+            "timestamp": time.time(),
+        }
+        self.queues[kind][receiver].append(message)
+
+        if self.verbose and (self._post_count % self.log_every == 0):
+            shape = getattr(payload, "shape", None)
+            self.logger.info(
+                f"[POST #{self._post_count}] kind={kind} sender={sender} "
+                f"receiver={receiver} session={session_id} shape={shape} msg_id={msg_id}"
+            )
+
+        return msg_id
+
+    def poll_message(self, kind: str, receiver: str, session_id: str | None = None):
+        """
+        Non-blocking poll for a single message of given kind + receiver.
+
+        If session_id is given, returns the earliest message for that session.
+        Otherwise, returns the earliest message for that receiver.
+        """
+        self._poll_count += 1
+
+        kind_queues = self.queues.get(kind)
+        if not kind_queues:
+            return None
+
+        msgs = kind_queues.get(receiver)
+        if not msgs:
+            return None
+
+        # Find matching message
+        if session_id is None:
+            msg = msgs.pop(0)
+        else:
+            idx = None
+            for i, m in enumerate(msgs):
+                if m["session_id"] == session_id:
+                    idx = i
+                    break
+            if idx is None:
+                return None
+            msg = msgs.pop(idx)
+
+        if self.verbose and (self._poll_count % self.log_every == 0):
+            shape = getattr(msg["payload"], "shape", None)
+            self.logger.info(
+                f"[POLL #{self._poll_count}] kind={kind} receiver={receiver} "
+                f"session={msg['session_id']} msg_id={msg['msg_id']} shape={shape}"
+            )
+
+        return msg
+
+
+# ============================================================
+# 5. Ray peer: M2 holder
 # ============================================================
 
 @ray.remote
@@ -136,22 +254,23 @@ class PeerM2:
     """
     Peer that holds M2 and performs its part of the computation.
 
-    Protocol:
-      - forward(session_id, z_cut_np) -> z_mid_np
-      - backward(session_id, dL_dz_mid_np) -> dL_dz_cut_np
+    It does NOT get called directly by clients.
+    Instead, it runs a loop where it:
 
-    We cache a tape per session so we can backprop M2 and dL/dz_cut
-    when the client sends the upstream gradient.
+      - polls the Board for fwd_req (from any M1M3)
+      - computes z_mid, caches tape and z_cut
+      - posts fwd_res back to the Board
+      - polls the Board for bwd_req
+      - computes grads, updates M2, posts bwd_res back
 
-    With verbosity enabled, logs:
-      - when a forward is received
-      - when a backward is processed (with some stats)
+    It also handles infer_req / infer_res for evaluation.
     """
 
     def __init__(
         self,
         name: str,
         run_dir: str,
+        board,
         input_dim: int = 128,
         lr: float = 1e-3,
         log_level: str = "INFO",
@@ -160,6 +279,8 @@ class PeerM2:
     ):
         self.name = name
         self.logger = setup_peer_logger(name, run_dir, log_level)
+        self.board = board
+
         self.M2 = build_M2(input_dim=input_dim)
         self.opt_M2 = optimizers.Adam(learning_rate=lr)
         self._sessions = {}  # session_id -> (tape, z_cut, z_mid)
@@ -168,15 +289,58 @@ class PeerM2:
         self.log_every = max(1, int(log_every))
         self._fwd_count = 0
         self._bwd_count = 0
+        self._infer_count = 0
 
         self.logger.info(
             f"Initialized PeerM2 with input_dim={input_dim}, lr={lr}, "
             f"verbose={self.verbose}, log_every={self.log_every}"
         )
 
-    def forward(self, session_id: str, z_cut_np: np.ndarray) -> np.ndarray:
-        """Forward pass through M2, recording a tape for this session."""
+    # ---------------- main processing loop ----------------
+
+    def run(self):
+        """
+        Main loop: process fwd_req, bwd_req, infer_req from the Board.
+        This is intended to run "forever" (until Ray shuts down).
+        """
+        self.logger.info("PeerM2.run() loop started.")
+        while True:
+            handled = False
+
+            # 1) Forward requests
+            fwd_msg = ray.get(self.board.poll_message.remote(
+                "fwd_req", receiver=self.name, session_id=None
+            ))
+            if fwd_msg is not None:
+                self._handle_forward(fwd_msg)
+                handled = True
+
+            # 2) Backward requests
+            bwd_msg = ray.get(self.board.poll_message.remote(
+                "bwd_req", receiver=self.name, session_id=None
+            ))
+            if bwd_msg is not None:
+                self._handle_backward(bwd_msg)
+                handled = True
+
+            # 3) Inference requests
+            infer_msg = ray.get(self.board.poll_message.remote(
+                "infer_req", receiver=self.name, session_id=None
+            ))
+            if infer_msg is not None:
+                self._handle_infer(infer_msg)
+                handled = True
+
+            if not handled:
+                time.sleep(0.01)  # idle wait
+
+    # ---------------- internal handlers ----------------
+
+    def _handle_forward(self, msg: dict):
         self._fwd_count += 1
+        session_id = msg["session_id"]
+        z_cut_np = msg["payload"]
+        sender = msg["sender"]
 
         z_cut = tf.convert_to_tensor(z_cut_np, dtype=tf.float32)
         with tf.GradientTape() as tape:
@@ -184,26 +348,35 @@ class PeerM2:
             z_mid = self.M2(z_cut, training=True)
 
         self._sessions[session_id] = (tape, z_cut, z_mid)
+        z_mid_np = z_mid.numpy()
+
+        # send response
+        ray.get(self.board.post_message.remote(
+            "fwd_res",
+            sender=self.name,
+            receiver=sender,
+            session_id=session_id,
+            payload=z_mid_np,
+        ))
 
         if self.verbose and (self._fwd_count % self.log_every == 0):
-            batch_size = z_cut_np.shape[0]
-            feat_dim = z_cut_np.shape[1] if z_cut_np.ndim > 1 else 1
+            bs = z_cut_np.shape[0]
+            feat = z_cut_np.shape[1] if z_cut_np.ndim > 1 else 1
             self.logger.info(
-                f"[FWD #{self._fwd_count}] session={session_id} "
-                f"batch={batch_size} feat_dim={feat_dim}"
+                f"[FWD #{self._fwd_count}] session={session_id} from={sender} "
+                f"batch={bs} feat_dim={feat}"
             )
 
-        return z_mid.numpy()
-
-    def backward(self, session_id: str, dL_dz_mid_np: np.ndarray) -> np.ndarray:
-        """
-        Backward pass through M2 using upstream gradient dL/dz_mid.
-        Returns dL/dz_cut for the client.
-        """
+    def _handle_backward(self, msg: dict):
         self._bwd_count += 1
+        session_id = msg["session_id"]
+        dL_dz_mid_np = msg["payload"]
+        sender = msg["sender"]
 
         if session_id not in self._sessions:
-            raise ValueError(f"No cached forward for session_id={session_id}")
+            self.logger.error(f"[BWD] no cached forward for session={session_id}")
+            return
+
         tape, z_cut, z_mid = self._sessions.pop(session_id)
 
         dL_dz_mid = tf.convert_to_tensor(dL_dz_mid_np, dtype=tf.float32)
@@ -213,38 +386,63 @@ class PeerM2:
         dL_dz_cut = grads_all[-1]
 
         self.opt_M2.apply_gradients(zip(grads_M2, self.M2.trainable_variables))
+        dL_dz_cut_np = dL_dz_cut.numpy()
+
+        ray.get(self.board.post_message.remote(
+            "bwd_res",
+            sender=self.name,
+            receiver=sender,
+            session_id=session_id,
+            payload=dL_dz_cut_np,
+        ))
 
         if self.verbose and (self._bwd_count % self.log_every == 0):
-            # A couple of simple scalar stats for debugging
             grad_norm = tf.linalg.global_norm(grads_M2).numpy()
             dzcut_norm = tf.linalg.global_norm([dL_dz_cut]).numpy()
             self.logger.info(
-                f"[BWD #{self._bwd_count}] session={session_id} "
+                f"[BWD #{self._bwd_count}] session={session_id} from={sender} "
                 f"grad_norm(M2)={grad_norm:.4f} grad_norm(dL/dz_cut)={dzcut_norm:.4f}"
             )
 
-        return dL_dz_cut.numpy()
+    def _handle_infer(self, msg: dict):
+        self._infer_count += 1
+        session_id = msg["session_id"]
+        z_cut_np = msg["payload"]
+        sender = msg["sender"]
 
-    def infer(self, z_cut_np: np.ndarray) -> np.ndarray:
-        """Forward-only pass for evaluation."""
         z_cut = tf.convert_to_tensor(z_cut_np, dtype=tf.float32)
         z_mid = self.M2(z_cut, training=False)
-        return z_mid.numpy()
+        z_mid_np = z_mid.numpy()
 
+        ray.get(self.board.post_message.remote(
+            "infer_res",
+            sender=self.name,
+            receiver=sender,
+            session_id=session_id,
+            payload=z_mid_np,
+        ))
+
+        if self.verbose and (self._infer_count % self.log_every == 0):
+            bs = z_cut_np.shape[0]
+            self.logger.info(
+                f"[INFER #{self._infer_count}] session={session_id} from={sender} batch={bs}"
+            )
 
 
 # ============================================================
-# 5. Ray peer: M1+M3 client
+# 6. Ray peer: M1+M3 client
 # ============================================================
 
 @ray.remote
 class PeerM1M3:
     """
-    A split-learning client peer:
+    A split-learning client peer (M1 + M3).
 
     - Holds M1 and M3.
     - Holds its own local training shard.
-    - Knows the PeerM2 actor it is bound to (by config).
+    - Knows:
+        - the Board actor
+        - the target M2 peer name (string)
     """
 
     def __init__(
@@ -255,11 +453,14 @@ class PeerM1M3:
         y_train: np.ndarray,
         x_test: np.ndarray,
         y_test: np.ndarray,
-        m2_peer,
+        board,
+        target_m2: str,
         epochs: int = 3,
         batch_size: int = 128,
         lr: float = 1e-3,
         log_level: str = "INFO",
+        verbose: bool = False,
+        log_every: int = 50,
     ):
         self.name = name
         self.logger = setup_peer_logger(name, run_dir, log_level)
@@ -268,7 +469,9 @@ class PeerM1M3:
         self.y_train = y_train
         self.x_test = x_test
         self.y_test = y_test
-        self.m2_peer = m2_peer
+        self.board = board
+        self.target_m2 = target_m2
+
         self.epochs = epochs
         self.batch_size = batch_size
 
@@ -278,10 +481,18 @@ class PeerM1M3:
         self.opt_M3 = optimizers.Adam(learning_rate=lr)
         self.loss_fn = losses.SparseCategoricalCrossentropy()
 
+        self.verbose = verbose
+        self.log_every = max(1, int(log_every))
+        self._fwd_count = 0
+        self._bwd_count = 0
+        self._infer_count = 0
+
         self.logger.info(
             f"Initialized PeerM1M3 epochs={epochs} batch_size={batch_size} lr={lr} "
-            f"bound_to_m2_peer={m2_peer}"
+            f"target_m2={target_m2} verbose={self.verbose} log_every={self.log_every}"
         )
+
+    # ---------------- training ----------------
 
     def train(self):
         n = len(self.x_train)
@@ -309,8 +520,39 @@ class PeerM1M3:
 
                 session_id = f"{self.name}-{epoch}-{step}-{uuid.uuid4().hex}"
 
-                # ----- call M2 peer: forward -----
-                z_mid_np = ray.get(self.m2_peer.forward.remote(session_id, z_cut_np))
+                # ----- send forward request to Board -----
+                self._fwd_count += 1
+                ray.get(self.board.post_message.remote(
+                    "fwd_req",
+                    sender=self.name,
+                    receiver=self.target_m2,
+                    session_id=session_id,
+                    payload=z_cut_np,
+                ))
+                if self.verbose and (self._fwd_count % self.log_every == 0):
+                    self.logger.info(
+                        f"[FWD_REQ #{self._fwd_count}] session={session_id} "
+                        f"to={self.target_m2} batch={z_cut_np.shape[0]}"
+                    )
+
+                # ----- wait for forward response (z_mid) -----
+                z_mid_np = None
+                while z_mid_np is None:
+                    msg = ray.get(self.board.poll_message.remote(
+                        "fwd_res",
+                        receiver=self.name,
+                        session_id=session_id,
+                    ))
+                    if msg is not None:
+                        z_mid_np = msg["payload"]
+                        if self.verbose and (self._fwd_count % self.log_every == 0):
+                            self.logger.info(
+                                f"[FWD_RES #{self._fwd_count}] session={session_id} "
+                                f"from={msg['sender']} shape={z_mid_np.shape}"
+                            )
+                        break
+                    time.sleep(0.01)
+
                 z_mid = tf.convert_to_tensor(z_mid_np, dtype=tf.float32)
 
                 # ----- M3 forward + loss, grad wrt z_mid -----
@@ -325,9 +567,40 @@ class PeerM1M3:
                 dL_dz_mid = grads_all[-1]
                 self.opt_M3.apply_gradients(zip(grads_M3, self.M3.trainable_variables))
 
-                # ----- call M2 peer: backward -----
+                # ----- send backward request (dL/dz_mid) -----
+                self._bwd_count += 1
                 dL_dz_mid_np = dL_dz_mid.numpy()
-                dL_dz_cut_np = ray.get(self.m2_peer.backward.remote(session_id, dL_dz_mid_np))
+                ray.get(self.board.post_message.remote(
+                    "bwd_req",
+                    sender=self.name,
+                    receiver=self.target_m2,
+                    session_id=session_id,
+                    payload=dL_dz_mid_np,
+                ))
+                if self.verbose and (self._bwd_count % self.log_every == 0):
+                    self.logger.info(
+                        f"[BWD_REQ #{self._bwd_count}] session={session_id} "
+                        f"to={self.target_m2}"
+                    )
+
+                # ----- wait for backward response (dL/dz_cut) -----
+                dL_dz_cut_np = None
+                while dL_dz_cut_np is None:
+                    msg = ray.get(self.board.poll_message.remote(
+                        "bwd_res",
+                        receiver=self.name,
+                        session_id=session_id,
+                    ))
+                    if msg is not None:
+                        dL_dz_cut_np = msg["payload"]
+                        if self.verbose and (self._bwd_count % self.log_every == 0):
+                            self.logger.info(
+                                f"[BWD_RES #{self._bwd_count}] session={session_id} "
+                                f"from={msg['sender']}"
+                            )
+                        break
+                    time.sleep(0.01)
+
                 dL_dz_cut = tf.convert_to_tensor(dL_dz_cut_np, dtype=tf.float32)
 
                 # ----- backprop through M1 -----
@@ -358,8 +631,10 @@ class PeerM1M3:
 
         return f"{self.name} training finished."
 
+    # ---------------- evaluation ----------------
+
     def evaluate(self) -> float:
-        """Full evaluation: x -> M1 -> PeerM2 -> M3."""
+        """Full evaluation: x -> M1 -> Board -> M2 -> Board -> M3."""
         batch_size = self.batch_size
         n = len(self.x_test)
         all_logits = []
@@ -369,7 +644,41 @@ class PeerM1M3:
             z_cut = self.M1(xb, training=False)
             z_cut_np = z_cut.numpy()
 
-            z_mid_np = ray.get(self.m2_peer.infer.remote(z_cut_np))
+            session_id = f"{self.name}-eval-{i}-{uuid.uuid4().hex}"
+
+            # send infer request
+            self._infer_count += 1
+            ray.get(self.board.post_message.remote(
+                "infer_req",
+                sender=self.name,
+                receiver=self.target_m2,
+                session_id=session_id,
+                payload=z_cut_np,
+            ))
+            if self.verbose and (self._infer_count % self.log_every == 0):
+                self.logger.info(
+                    f"[INFER_REQ #{self._infer_count}] session={session_id} "
+                    f"to={self.target_m2} batch={z_cut_np.shape[0]}"
+                )
+
+            # wait for infer response
+            z_mid_np = None
+            while z_mid_np is None:
+                msg = ray.get(self.board.poll_message.remote(
+                    "infer_res",
+                    receiver=self.name,
+                    session_id=session_id,
+                ))
+                if msg is not None:
+                    z_mid_np = msg["payload"]
+                    if self.verbose and (self._infer_count % self.log_every == 0):
+                        self.logger.info(
+                            f"[INFER_RES #{self._infer_count}] session={session_id} "
+                            f"from={msg['sender']} shape={z_mid_np.shape}"
+                        )
+                    break
+                time.sleep(0.01)
+
             z_mid = tf.convert_to_tensor(z_mid_np, dtype=tf.float32)
             logits = self.M3(z_mid, training=False)
             all_logits.append(logits.numpy())
@@ -381,7 +690,7 @@ class PeerM1M3:
 
 
 # ============================================================
-# 6. Main with config + run folder + suppression flag
+# 7. Main with config + run folder + suppression flag
 # ============================================================
 
 def main(config_path: str = "config.yaml"):
@@ -408,10 +717,22 @@ def main(config_path: str = "config.yaml"):
     suppress_warnings = bool(general.get("suppress_warnings", False))
     log_level = general.get("log_level", "INFO")
 
+    m2_verbose = bool(general.get("m2_verbose", False))
+    m2_log_every = int(general.get("m2_log_every", 50))
+
+    m1m3_verbose = bool(general.get("m1m3_verbose", False))
+    m1m3_log_every = int(general.get("m1m3_log_every", 50))
+
+    board_verbose = bool(general.get("board_verbose", False))
+    board_log_every = int(general.get("board_log_every", 100))
+
     # ---- Global logger ----
     global_logger = setup_global_logger(run_dir, log_level)
     global_logger.info(f"Run dir: {run_dir}")
-    global_logger.info(f"Config: epochs={epochs}, batch_size={batch_size}, lr={lr}")
+    global_logger.info(
+        f"Config: epochs={epochs}, batch_size={batch_size}, lr={lr}, "
+        f"m2_verbose={m2_verbose}, m1m3_verbose={m1m3_verbose}, board_verbose={board_verbose}"
+    )
 
     # ---- Control Ray warnings ----
     os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
@@ -435,9 +756,15 @@ def main(config_path: str = "config.yaml"):
     n_clients = len(m1m3_peers_cfg)
     global_logger.info(f"Configured {n_clients} M1M3 peers and {len(m2_peers_cfg)} M2 peers.")
 
-    # NEW: read M2 verbosity settings
-    m2_verbose = bool(general.get("m2_verbose", False))
-    m2_log_every = int(general.get("m2_log_every", 50))
+    # ---- Board actor ----
+    board = Board.remote(
+        name="board",
+        run_dir=run_dir,
+        log_level=log_level,
+        verbose=board_verbose,
+        log_every=board_log_every,
+    )
+    global_logger.info("Spawned Board actor.")
 
     # Shard training data across M1M3 peers
     x_shards = np.array_split(x_train, n_clients)
@@ -450,17 +777,22 @@ def main(config_path: str = "config.yaml"):
         m2_peer = PeerM2.remote(
             name=name,
             run_dir=run_dir,
+            board=board,
             input_dim=128,
             lr=lr,
             log_level=log_level,
-            verbose=m2_verbose,       # <-- NEW
-            log_every=m2_log_every,   # <-- NEW
+            verbose=m2_verbose,
+            log_every=m2_log_every,
         )
         m2_peers[name] = m2_peer
         global_logger.info(f"Spawned M2 peer: {name}")
 
+    # Launch M2 processing loops (fire-and-forget)
+    for name, m2_peer in m2_peers.items():
+        m2_peer.run.remote()
+        global_logger.info(f"Started run() loop for M2 peer: {name}")
 
-    # Create M1M3 peers, binding each to its configured M2 peer
+    # Create M1M3 peers, binding each to its configured M2 peer name
     clients = []
     for i, c_cfg in enumerate(m1m3_peers_cfg):
         name = c_cfg["name"]
@@ -468,7 +800,6 @@ def main(config_path: str = "config.yaml"):
         if target_m2 not in m2_peers:
             raise ValueError(f"M1M3 peer {name} references unknown M2 peer '{target_m2}'")
 
-        m2_peer_handle = m2_peers[target_m2]
         client = PeerM1M3.remote(
             name=name,
             run_dir=run_dir,
@@ -476,11 +807,14 @@ def main(config_path: str = "config.yaml"):
             y_train=y_shards[i],
             x_test=x_test,
             y_test=y_test,
-            m2_peer=m2_peer_handle,
+            board=board,
+            target_m2=target_m2,
             epochs=epochs,
             batch_size=batch_size,
             lr=lr,
             log_level=log_level,
+            verbose=m1m3_verbose,
+            log_every=m1m3_log_every,
         )
         clients.append(client)
         global_logger.info(f"Spawned M1M3 peer: {name} → bound to M2 peer: {target_m2}")
