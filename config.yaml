@@ -1,20 +1,26 @@
-general:
-  debug: true
-  log_dir: "logs"
-  server_addr: "localhost:50051"
-  notify_mode: "type"        # [type|untyped|poll]
-  m2_mode: "blind"           # [blind|designated]
-  poll_interval: 1.0
-  random_jitter: true
+run:
+  base_dir: "runs"
+  name: null          # or "my_experiment_01"
 
-clients:
-  - id: 1
-    role: "M1M3"
-    epochs: 2
-    batch_size: 64
-  - id: 2
-    role: "M1M3"
-    epochs: 2
-    batch_size: 64
-  - id: 3
-    role: "M2"
+general:
+  epochs: 3
+  batch_size: 128
+  lr: 0.001
+  suppress_warnings: true   # hide Ray noise
+  log_level: "INFO"
+  
+  m2_verbose: true      # if true, M2 logs every few fwd/bwd calls
+  m2_log_every: 50      # log every N forward/backward operations
+
+peers:
+  M2:
+    - name: "m2_a"
+    - name: "m2_b"
+
+  M1M3:
+    - name: "client_1"
+      target_m2: "m2_a"
+    - name: "client_2"
+      target_m2: "m2_a"
+    - name: "client_3"
+      target_m2: "m2_b"
