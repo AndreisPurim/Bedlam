@@ -55,6 +55,7 @@ class BucketPeerM2:
         m1_model: str = "default",
         m2_model: str = "default",
         m3_model: str = "default",
+        pad_multiple: int = 1024,
         input_dim: int = 128,
         lr: float = 1e-3,
         shared_key: str | None = None,
@@ -68,6 +69,7 @@ class BucketPeerM2:
         self.m1_model = m1_model
         self.m2_model = m2_model
         self.m3_model = m3_model
+        self.pad_multiple = pad_multiple
 
         _, self.M2, _ = build_split_models(
             m1_name=self.m1_model,
@@ -134,7 +136,7 @@ class BucketPeerM2:
         self._sessions[session_id] = (tape, z_cut, z_mid)
         z_mid_np = z_mid.numpy()
 
-        resp = encode_message("FWD_RES", session_id, self.name, z_mid_np, self.shared_key, target_m2=self.name)
+        resp = encode_message("FWD_RES", session_id, self.name, z_mid_np, self.shared_key, target_m2=self.name, pad_multiple=self.pad_multiple)
         self.board.update_bucket(bucket_id, resp)
         self._seen_bucket_ops[bucket_id] = "FWD_RES"
 
@@ -152,7 +154,7 @@ class BucketPeerM2:
         self.opt_M2.apply_gradients(zip(grads_M2, self.M2.trainable_variables))
         dL_dz_cut_np = dL_dz_cut.numpy()
 
-        resp = encode_message("BWD_RES", session_id, self.name, dL_dz_cut_np, self.shared_key, target_m2=self.name)
+        resp = encode_message("BWD_RES", session_id, self.name, dL_dz_cut_np, self.shared_key, target_m2=self.name, pad_multiple=self.pad_multiple)
         self.board.update_bucket(bucket_id, resp)
         self._seen_bucket_ops[bucket_id] = "BWD_RES"
 
@@ -162,7 +164,7 @@ class BucketPeerM2:
         z_mid = self.M2(z_cut, training=False)
         z_mid_np = z_mid.numpy()
 
-        resp = encode_message("INFER_RES", session_id, self.name, z_mid_np, self.shared_key, target_m2=self.name)
+        resp = encode_message("INFER_RES", session_id, self.name, z_mid_np, self.shared_key, target_m2=self.name, pad_multiple=self.pad_multiple)
         self.board.update_bucket(bucket_id, resp)
         self._seen_bucket_ops[bucket_id] = "INFER_RES"
 
@@ -187,6 +189,7 @@ class BucketPeerM1M3:
         m1_model: str = "default",
         m2_model: str = "default",
         m3_model: str = "default",
+        pad_multiple: int = 1024,
         shared_key: str | None = None,
         epochs: int = 3,
         batch_size: int = 128,
@@ -207,6 +210,8 @@ class BucketPeerM1M3:
         self.m1_model = m1_model
         self.m2_model = m2_model
         self.m3_model = m3_model
+        self.pad_multiple = pad_multiple
+        self.pad_multiple = pad_multiple
 
         self.epochs = epochs
         self.batch_size = batch_size
@@ -276,6 +281,7 @@ class BucketPeerM1M3:
                     tensor=z_cut_np,
                     key_str=self.shared_key,
                     target_m2=self.target_m2,
+                    pad_multiple=self.pad_multiple,
                 )
                 bucket_id = self.board.create_bucket(payload)
 
@@ -305,6 +311,7 @@ class BucketPeerM1M3:
                     tensor=dL_dz_mid_np,
                     key_str=self.shared_key,
                     target_m2=self.target_m2,
+                    pad_multiple=self.pad_multiple,
                 )
                 self.board.update_bucket(bucket_id, payload)
 
@@ -373,6 +380,7 @@ class BucketPeerM1M3:
                 tensor=z_cut_np,
                 key_str=self.shared_key,
                 target_m2=self.target_m2,
+                pad_multiple=self.pad_multiple,
             )
             bucket_id = self.board.create_bucket(payload)
 
@@ -420,6 +428,9 @@ def main(config_path: str = "config.yaml"):
     m1_model = model_arch
     m2_model = model_arch
     m3_model = model_arch
+    if "pad_multiple" not in general:
+        raise ValueError("general.pad_multiple must be defined in config.yaml")
+    pad_multiple = int(general["pad_multiple"])
 
     board_host = general.get("board_host", "localhost")
     board_port = int(general.get("board_port", 50051))  # unified board default
@@ -431,6 +442,11 @@ def main(config_path: str = "config.yaml"):
         f"m2_verbose={m2_verbose}, m1m3_verbose={m1m3_verbose}, bucket_board_addr={board_host}:{board_port} "
         f"model_architecture={model_arch}"
     )
+    try:
+        import shutil
+        shutil.copyfile(config_path, os.path.join(run_dir, "config_used.yaml"))
+    except Exception as e:
+        global_logger.warning(f"Could not save config snapshot: {e}")
 
     os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
     ray_logging_level = logging.ERROR if suppress_warnings else logging.INFO

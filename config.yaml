@@ -12,6 +12,7 @@ general:
   board_port: 50051
   # model architectures: default | mlp | deep | resnet-lite
   model_architecture: "mlp"
+  pad_multiple: 1024
 
   # architecture options:
   #   board-blind              -> per-receiver queues

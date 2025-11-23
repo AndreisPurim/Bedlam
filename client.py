@@ -29,7 +29,7 @@ Privacy-ish features:
     blob     = nonce || ct
 
 - Padding:
-    plaintext is padded to a multiple of PAD_MULTIPLE bytes before encryption.
+    plaintext is padded to a multiple of the configured pad size before encryption.
 
 - Pseudonyms:
     Each M1M3 client generates a random pseudonym per run:
@@ -114,7 +114,6 @@ def setup_peer_logger(peer_name: str, run_dir: str, level: str = "INFO") -> logg
 # 2. Payload encoding / encrypted envelopes / padding
 # ============================================================
 
-PAD_MULTIPLE = 1024  # pad plaintext to a multiple of this (bytes) before encryption
 
 # Audience buckets for single-blind-two-pools pooled delivery
 AUDIENCE_TO_M2 = "to_m2"
@@ -184,6 +183,7 @@ def encode_message(
     tensor: np.ndarray,
     key_str: str,
     target_m2: str | None = None,
+    pad_multiple: int | None = None,
 ) -> bytes:
     """
     Build an encrypted, padded envelope:
@@ -201,7 +201,7 @@ def encode_message(
     Then:
         ciphertext = _crypt_bytes(plaintext, key_str)
 
-    The ciphertext length is padded at the *plaintext* level to a multiple of PAD_MULTIPLE
+    The ciphertext length is padded at the *plaintext* level to a multiple of the configured pad size
     before encryption, so the Board only sees coarse-grained sizes.
     """
     tensor_bytes = tensor_to_bytes(tensor)
@@ -219,8 +219,10 @@ def encode_message(
 
     base_plain = header_len.to_bytes(4, "big") + header_bytes + tensor_bytes
 
-    # Pad plaintext to multiple of PAD_MULTIPLE
-    pad_len = (-len(base_plain)) % PAD_MULTIPLE
+    if pad_multiple is None or pad_multiple <= 0:
+        raise ValueError("pad_multiple must be a positive integer from config")
+    # Pad plaintext to configured multiple
+    pad_len = (-len(base_plain)) % pad_multiple
     if pad_len:
         base_plain += secrets.token_bytes(pad_len)
 
@@ -379,6 +381,7 @@ class PeerM2:
         m1_model: str,
         m2_model: str,
         m3_model: str,
+        pad_multiple: int,
         input_dim: int = 128,
         lr: float = 1e-3,
         shared_key: str | None = None,
@@ -393,6 +396,7 @@ class PeerM2:
         self.m1_model = m1_model
         self.m2_model = m2_model
         self.m3_model = m3_model
+        self.pad_multiple = pad_multiple
 
         _, self.M2, _ = build_split_models(
             m1_name=self.m1_model,
@@ -488,7 +492,7 @@ class PeerM2:
         self._sessions[session_id] = (tape, z_cut, z_mid)
         z_mid_np = z_mid.numpy()
 
-        payload = encode_message("FWD_RES", session_id, self.name, z_mid_np, self.shared_key, target_m2=self.name)
+        payload = encode_message("FWD_RES", session_id, self.name, z_mid_np, self.shared_key, target_m2=self.name, pad_multiple=self.pad_multiple)
         if self.architecture == "board-blind":
             self.board_client.post_message(
                 sender=self.name,
@@ -529,7 +533,7 @@ class PeerM2:
         self.opt_M2.apply_gradients(zip(grads_M2, self.M2.trainable_variables))
         dL_dz_cut_np = dL_dz_cut.numpy()
 
-        payload = encode_message("BWD_RES", session_id, self.name, dL_dz_cut_np, self.shared_key, target_m2=self.name)
+        payload = encode_message("BWD_RES", session_id, self.name, dL_dz_cut_np, self.shared_key, target_m2=self.name, pad_multiple=self.pad_multiple)
         if self.architecture == "board-blind":
             self.board_client.post_message(
                 sender=self.name,
@@ -559,7 +563,7 @@ class PeerM2:
         z_mid = self.M2(z_cut, training=False)
         z_mid_np = z_mid.numpy()
 
-        payload = encode_message("INFER_RES", session_id, self.name, z_mid_np, self.shared_key, target_m2=self.name)
+        payload = encode_message("INFER_RES", session_id, self.name, z_mid_np, self.shared_key, target_m2=self.name, pad_multiple=self.pad_multiple)
         if self.architecture == "board-blind":
             self.board_client.post_message(
                 sender=self.name,
@@ -619,6 +623,7 @@ class PeerM1M3:
         m1_model: str = "default",
         m2_model: str = "default",
         m3_model: str = "default",
+        pad_multiple: int = 1024,
         shared_key: str | None = None,
         epochs: int = 3,
         batch_size: int = 128,
@@ -639,6 +644,7 @@ class PeerM1M3:
         self.m1_model = m1_model
         self.m2_model = m2_model
         self.m3_model = m3_model
+        self.pad_multiple = pad_multiple
         self.target_m2 = target_m2
 
         self.epochs = epochs
@@ -709,7 +715,7 @@ class PeerM1M3:
                 # ----- send FWD_REQ envelope -----
                 self._fwd_count += 1
                 if self.architecture == "board-blind":
-                    payload = encode_message("FWD_REQ", session_id, self.pseudonym, z_cut_np, self.shared_key)
+                    payload = encode_message("FWD_REQ", session_id, self.pseudonym, z_cut_np, self.shared_key, pad_multiple=self.pad_multiple)
                     self.board_client.post_message(
                         sender=self.pseudonym,     # Board sees pseudonym
                         receiver=self.target_m2,   # M2 actor name
@@ -723,6 +729,7 @@ class PeerM1M3:
                         tensor=z_cut_np,
                         key_str=self.shared_key,
                         target_m2=self.target_m2,
+                        pad_multiple=self.pad_multiple,
                     )
                     self.board_client.post_message(
                         sender="",
@@ -798,7 +805,7 @@ class PeerM1M3:
                 self._bwd_count += 1
                 dL_dz_mid_np = dL_dz_mid.numpy()
                 if self.architecture == "board-blind":
-                    payload = encode_message("BWD_REQ", session_id, self.pseudonym, dL_dz_mid_np, self.shared_key)
+                    payload = encode_message("BWD_REQ", session_id, self.pseudonym, dL_dz_mid_np, self.shared_key, pad_multiple=self.pad_multiple)
                     self.board_client.post_message(
                         sender=self.pseudonym,
                         receiver=self.target_m2,
@@ -812,6 +819,7 @@ class PeerM1M3:
                         tensor=dL_dz_mid_np,
                         key_str=self.shared_key,
                         target_m2=self.target_m2,
+                        pad_multiple=self.pad_multiple,
                     )
                     self.board_client.post_message(
                         sender="",
@@ -916,7 +924,7 @@ class PeerM1M3:
             # send INFER_REQ
             self._infer_count += 1
             if self.architecture == "board-blind":
-                payload = encode_message("INFER_REQ", session_id, self.pseudonym, z_cut_np, self.shared_key)
+                payload = encode_message("INFER_REQ", session_id, self.pseudonym, z_cut_np, self.shared_key, pad_multiple=self.pad_multiple)
                 self.board_client.post_message(
                     sender=self.pseudonym,
                     receiver=self.target_m2,
@@ -930,6 +938,7 @@ class PeerM1M3:
                     tensor=z_cut_np,
                     key_str=self.shared_key,
                     target_m2=self.target_m2,
+                    pad_multiple=self.pad_multiple,
                 )
                 self.board_client.post_message(
                     sender="",
@@ -1025,9 +1034,9 @@ def main(config_path: str = "config.yaml"):
     m1_model = model_arch
     m2_model = model_arch
     m3_model = model_arch
-    m1_model = general.get("m1_model", "default")
-    m2_model = general.get("m2_model", "default")
-    m3_model = general.get("m3_model", "default")
+    if "pad_multiple" not in general:
+        raise ValueError("general.pad_multiple must be defined in config.yaml")
+    pad_multiple = int(general["pad_multiple"])
 
     m2_verbose = bool(general.get("m2_verbose", False))
     m2_log_every = int(general.get("m2_log_every", 50))
@@ -1052,6 +1061,12 @@ def main(config_path: str = "config.yaml"):
         f"m2_verbose={m2_verbose}, m1m3_verbose={m1m3_verbose}, board_addr={board_host}:{board_port}, "
         f"architecture={architecture}, model_architecture={model_arch}"
     )
+    # Save config snapshot
+    try:
+        import shutil
+        shutil.copyfile(config_path, os.path.join(run_dir, "config_used.yaml"))
+    except Exception as e:
+        global_logger.warning(f"Could not save config snapshot: {e}")
 
     # ---- Control Ray warnings ----
     os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
@@ -1102,6 +1117,7 @@ def main(config_path: str = "config.yaml"):
             m1_model=m1_model,
             m2_model=m2_model,
             m3_model=m3_model,
+            pad_multiple=pad_multiple,
             input_dim=128,
             lr=lr,
             shared_key=key,
@@ -1139,6 +1155,7 @@ def main(config_path: str = "config.yaml"):
             m1_model=m1_model,
             m2_model=m2_model,
             m3_model=m3_model,
+            pad_multiple=pad_multiple,
             target_m2=target_m2,
             shared_key=key,
             epochs=epochs,
