@@ -115,6 +115,10 @@ def setup_peer_logger(peer_name: str, run_dir: str, level: str = "INFO") -> logg
 
 PAD_MULTIPLE = 1024  # pad plaintext to a multiple of this (bytes) before encryption
 
+# Audience buckets for single-blind-two-pools pooled delivery
+AUDIENCE_TO_M2 = "to_m2"
+AUDIENCE_TO_CLIENTS = "to_clients"
+
 
 def _derive_key(passphrase: str) -> bytes | None:
     """
@@ -175,9 +179,10 @@ def _crypt_bytes(data: bytes, key_str: str) -> bytes:
 def encode_message(
     op: str,
     session: str,
-    sender_pseudo: str,
+    sender_pseudo: str | None,
     tensor: np.ndarray,
     key_str: str,
+    target_m2: str | None = None,
 ) -> bytes:
     """
     Build an encrypted, padded envelope:
@@ -202,9 +207,12 @@ def encode_message(
     header = {
         "op": op,
         "session": session,
-        "sender": sender_pseudo,
         "tensor_len": len(tensor_bytes),
     }
+    if sender_pseudo:
+        header["sender"] = sender_pseudo
+    if target_m2:
+        header["target_m2"] = target_m2
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
     header_len = len(header_bytes)
 
@@ -254,8 +262,8 @@ def decode_message(blob: bytes, key_str: str):
 
     op = header["op"]
     session = header["session"]
-    sender = header["sender"]
-    return op, session, sender, tensor
+    sender = header.get("sender")
+    return op, session, sender, tensor, header
 
 
 # ============================================================
@@ -323,12 +331,16 @@ class GrpcBoardClient:
         self.host = host
         self.port = port
         self.logger = logger or logging.getLogger("GrpcBoardClient")
-        self.channel = grpc.insecure_channel(f"{host}:{port}")
+        grpc_opts = [
+            ("grpc.max_send_message_length", 128 * 1024 * 1024),
+            ("grpc.max_receive_message_length", 128 * 1024 * 1024),
+        ]
+        self.channel = grpc.insecure_channel(f"{host}:{port}", options=grpc_opts)
         self.stub = board_pb2_grpc.BoardServiceStub(self.channel)
         self.logger.info("Connected GrpcBoardClient to %s:%d", host, port)
 
-    def post_message(self, sender: str, receiver: str, payload: bytes) -> str:
-        req = board_pb2.PostMessageRequest(sender=sender, receiver=receiver, payload=payload)
+    def post_message(self, sender: str, receiver: str = "", payload: bytes = b"", audience: str | None = None) -> str:
+        req = board_pb2.PostMessageRequest(sender=sender, receiver=receiver, payload=payload, audience=audience or "")
         resp = self.stub.PostMessage(req)
         return resp.msg_id
 
@@ -345,6 +357,25 @@ class GrpcBoardClient:
             "payload": bytes(msg.payload),
             "timestamp": msg.timestamp_ms / 1000.0,
         }
+
+    def poll_pool(self, audience: str, limit_count: int | None = None):
+        req = board_pb2.PollPoolRequest(audience=audience)
+        resp = self.stub.PollPool(req)
+        return [
+            {
+                "msg_id": m.msg_id,
+                "sender": m.sender,
+                "receiver": m.receiver,
+                "payload": bytes(m.payload),
+                "timestamp": m.timestamp_ms / 1000.0,
+            }
+            for m in resp.messages
+        ]
+
+    def ack_message(self, msg_id: str, audience: str | None = None) -> bool:
+        req = board_pb2.AckMessageRequest(msg_id=msg_id, audience=audience or "")
+        resp = self.stub.AckMessage(req)
+        return resp.removed
 
 
 # ============================================================
@@ -373,6 +404,7 @@ class PeerM2:
         run_dir: str,
         board_host: str,
         board_port: int,
+        architecture: str,
         input_dim: int = 128,
         lr: float = 1e-3,
         shared_key: str | None = None,
@@ -383,6 +415,7 @@ class PeerM2:
         self.name = name
         self.logger = setup_peer_logger(name, run_dir, log_level)
         self.board_client = GrpcBoardClient(board_host, board_port, logger=self.logger)
+        self.architecture = architecture
 
         self.M2 = build_M2(input_dim=input_dim)
         self.opt_M2 = optimizers.Adam(learning_rate=lr)
@@ -394,6 +427,7 @@ class PeerM2:
         self._fwd_count = 0
         self._bwd_count = 0
         self._infer_count = 0
+        self._seen_msg_ids: set[str] = set()  # dedup when pooling
 
         self.logger.info(
             f"Initialized PeerM2 with input_dim={input_dim}, lr={lr}, "
@@ -405,29 +439,58 @@ class PeerM2:
         """Main loop: process messages from the Board."""
         self.logger.info("PeerM2.run() loop started.")
         while True:
-            msg = self.board_client.poll_message(receiver=self.name)
-            if msg is None:
+            if self.architecture == "board-blind":
+                msgs = []
+                msg = self.board_client.poll_message(receiver=self.name)
+                if msg:
+                    msgs.append(msg)
+            else:
+                msgs = self.board_client.poll_pool(AUDIENCE_TO_M2)
+
+            if not msgs:
                 time.sleep(0.01)
                 continue
 
-            try:
-                op, session, sender_pseudo, tensor = decode_message(
-                    msg["payload"], self.shared_key
-                )
-            except Exception as e:
-                self.logger.error(f"Failed to decode message: {e}")
-                continue
+            for msg in msgs:
+                msg_id = msg["msg_id"]
+                if msg_id in self._seen_msg_ids:
+                    continue
+                self._seen_msg_ids.add(msg_id)
 
-            if op == "FWD_REQ":
-                self._handle_forward(session, sender_pseudo, tensor)
-            elif op == "BWD_REQ":
-                self._handle_backward(session, sender_pseudo, tensor)
-            elif op == "INFER_REQ":
-                self._handle_infer(session, sender_pseudo, tensor)
-            else:
-                self.logger.warning(
-                    f"Unknown op '{op}' in session={session} from={sender_pseudo}"
-                )
+                try:
+                    op, session, sender_pseudo, tensor, header = decode_message(
+                        msg["payload"], self.shared_key
+                    )
+                except Exception as e:
+                    if self.architecture == "single-blind-two-pools":
+                        continue  # likely not intended for this peer/key
+                    self.logger.error(f"Failed to decode message: {e}")
+                    continue
+
+                if self.architecture == "single-blind-two-pools":
+                    target = header.get("target_m2")
+                    if target and target != self.name:
+                        continue
+                    sender_pseudo = sender_pseudo or "unknown"
+
+                handled = False
+                if op == "FWD_REQ":
+                    self._handle_forward(session, sender_pseudo, tensor)
+                    handled = True
+                elif op == "BWD_REQ":
+                    self._handle_backward(session, sender_pseudo, tensor)
+                    handled = True
+                elif op == "INFER_REQ":
+                    self._handle_infer(session, sender_pseudo, tensor)
+                    handled = True
+                else:
+                    self.logger.warning(
+                        f"Unknown op '{op}' in session={session} from={sender_pseudo}"
+                    )
+
+                if handled and self.architecture == "single-blind-two-pools":
+                    # Acknowledge consumption of this request so Board can shrink the pool.
+                    self.board_client.ack_message(msg_id=msg_id, audience=AUDIENCE_TO_M2)
 
     # ---------------- internal handlers ----------------
 
@@ -442,12 +505,20 @@ class PeerM2:
         self._sessions[session_id] = (tape, z_cut, z_mid)
         z_mid_np = z_mid.numpy()
 
-        payload = encode_message("FWD_RES", session_id, self.name, z_mid_np, self.shared_key)
-        self.board_client.post_message(
-            sender=self.name,
-            receiver=sender_pseudo,
-            payload=payload,
-        )
+        payload = encode_message("FWD_RES", session_id, self.name, z_mid_np, self.shared_key, target_m2=self.name)
+        if self.architecture == "board-blind":
+            self.board_client.post_message(
+                sender=self.name,
+                receiver=sender_pseudo,
+                payload=payload,
+            )
+        else:
+            self.board_client.post_message(
+                sender=self.name,
+                receiver="",
+                audience=AUDIENCE_TO_CLIENTS,
+                payload=payload,
+            )
 
         if self.verbose and (self._fwd_count % self.log_every == 0):
             bs = z_cut_np.shape[0]
@@ -475,12 +546,20 @@ class PeerM2:
         self.opt_M2.apply_gradients(zip(grads_M2, self.M2.trainable_variables))
         dL_dz_cut_np = dL_dz_cut.numpy()
 
-        payload = encode_message("BWD_RES", session_id, self.name, dL_dz_cut_np, self.shared_key)
-        self.board_client.post_message(
-            sender=self.name,
-            receiver=sender_pseudo,
-            payload=payload,
-        )
+        payload = encode_message("BWD_RES", session_id, self.name, dL_dz_cut_np, self.shared_key, target_m2=self.name)
+        if self.architecture == "board-blind":
+            self.board_client.post_message(
+                sender=self.name,
+                receiver=sender_pseudo,
+                payload=payload,
+            )
+        else:
+            self.board_client.post_message(
+                sender=self.name,
+                receiver="",
+                audience=AUDIENCE_TO_CLIENTS,
+                payload=payload,
+            )
 
         if self.verbose and (self._bwd_count % self.log_every == 0):
             grad_norm = tf.linalg.global_norm(grads_M2).numpy()
@@ -497,12 +576,20 @@ class PeerM2:
         z_mid = self.M2(z_cut, training=False)
         z_mid_np = z_mid.numpy()
 
-        payload = encode_message("INFER_RES", session_id, self.name, z_mid_np, self.shared_key)
-        self.board_client.post_message(
-            sender=self.name,
-            receiver=sender_pseudo,
-            payload=payload,
-        )
+        payload = encode_message("INFER_RES", session_id, self.name, z_mid_np, self.shared_key, target_m2=self.name)
+        if self.architecture == "board-blind":
+            self.board_client.post_message(
+                sender=self.name,
+                receiver=sender_pseudo,
+                payload=payload,
+            )
+        else:
+            self.board_client.post_message(
+                sender=self.name,
+                receiver="",
+                audience=AUDIENCE_TO_CLIENTS,
+                payload=payload,
+            )
 
         if self.verbose and (self._infer_count % self.log_every == 0):
             bs = z_cut_np.shape[0]
@@ -544,6 +631,7 @@ class PeerM1M3:
         y_test: np.ndarray,
         board_host: str,
         board_port: int,
+        architecture: str,
         target_m2: str,
         shared_key: str | None = None,
         epochs: int = 3,
@@ -561,6 +649,7 @@ class PeerM1M3:
         self.x_test = x_test
         self.y_test = y_test
         self.board_client = GrpcBoardClient(board_host, board_port, logger=self.logger)
+        self.architecture = architecture
         self.target_m2 = target_m2
 
         self.epochs = epochs
@@ -578,6 +667,7 @@ class PeerM1M3:
         self._fwd_count = 0
         self._bwd_count = 0
         self._infer_count = 0
+        self._seen_msg_ids: set[str] = set()  # dedup when pooling
 
         # per-run pseudonym for this client
         self.pseudonym = f"cli_{uuid.uuid4().hex[:8]}"
@@ -624,12 +714,28 @@ class PeerM1M3:
 
                 # ----- send FWD_REQ envelope -----
                 self._fwd_count += 1
-                payload = encode_message("FWD_REQ", session_id, self.pseudonym, z_cut_np, self.shared_key)
-                self.board_client.post_message(
-                    sender=self.pseudonym,     # Board sees pseudonym
-                    receiver=self.target_m2,   # M2 actor name
-                    payload=payload,
-                )
+                if self.architecture == "board-blind":
+                    payload = encode_message("FWD_REQ", session_id, self.pseudonym, z_cut_np, self.shared_key)
+                    self.board_client.post_message(
+                        sender=self.pseudonym,     # Board sees pseudonym
+                        receiver=self.target_m2,   # M2 actor name
+                        payload=payload,
+                    )
+                else:
+                    payload = encode_message(
+                        "FWD_REQ",
+                        session_id,
+                        sender_pseudo=None,
+                        tensor=z_cut_np,
+                        key_str=self.shared_key,
+                        target_m2=self.target_m2,
+                    )
+                    self.board_client.post_message(
+                        sender="",
+                        receiver="",
+                        audience=AUDIENCE_TO_M2,
+                        payload=payload,
+                    )
                 if self.verbose and (self._fwd_count % self.log_every == 0):
                     self.logger.info(
                         f"[FWD_REQ #{self._fwd_count}] session={session_id} "
@@ -639,31 +745,46 @@ class PeerM1M3:
                 # ----- wait for FWD_RES -----
                 z_mid_np = None
                 while z_mid_np is None:
-                    msg = self.board_client.poll_message(
-                        receiver=self.pseudonym,   # responses addressed to pseudonym
-                    )
-                    if msg is None:
+                    if self.architecture == "board-blind":
+                        msgs = []
+                        msg = self.board_client.poll_message(
+                            receiver=self.pseudonym,   # responses addressed to pseudonym
+                        )
+                        if msg:
+                            msgs.append(msg)
+                    else:
+                        msgs = self.board_client.poll_pool(AUDIENCE_TO_CLIENTS)
+                    if not msgs:
                         time.sleep(0.01)
                         continue
-                    try:
-                        op, sess, sender_name, tensor = decode_message(msg["payload"], self.shared_key)
-                    except Exception as e:
-                        self.logger.error(f"Failed to decode FWD_RES: {e}")
-                        continue
-                    if op != "FWD_RES" or sess != session_id:
-                        # In current design this should not happen; warn and continue.
-                        self.logger.warning(
-                            f"Unexpected op='{op}' or session='{sess}' "
-                            f"in FWD_RES for session={session_id}"
-                        )
-                        continue
-                    z_mid_np = tensor
-                    if self.verbose and (self._fwd_count % self.log_every == 0):
-                        self.logger.info(
-                            f"[FWD_RES #{self._fwd_count}] session={session_id} "
-                            f"from={sender_name} shape={z_mid_np.shape}"
-                        )
-                    break
+                    for msg in msgs:
+                        msg_id = msg["msg_id"]
+                        if msg_id in self._seen_msg_ids:
+                            continue
+                        self._seen_msg_ids.add(msg_id)
+                        try:
+                            op, sess, sender_name, tensor, header = decode_message(msg["payload"], self.shared_key)
+                        except Exception as e:
+                            if self.architecture == "single-blind-two-pools":
+                                continue  # not for this client/key
+                            self.logger.error(f"Failed to decode FWD_RES: {e}")
+                            continue
+                        if op != "FWD_RES" or sess != session_id:
+                            continue
+                        z_mid_np = tensor
+                        if self.verbose and (self._fwd_count % self.log_every == 0):
+                            self.logger.info(
+                                f"[FWD_RES #{self._fwd_count}] session={session_id} "
+                                f"from={sender_name} shape={z_mid_np.shape}"
+                            )
+                        # acknowledge to shrink pool
+                        if self.architecture == "single-blind-two-pools":
+                            self.board_client.ack_message(msg_id=msg_id, audience=AUDIENCE_TO_CLIENTS)
+                        if self.architecture == "single-blind-two-pools":
+                            self.board_client.ack_message(msg_id=msg_id, audience=AUDIENCE_TO_CLIENTS)
+                        break
+                    if z_mid_np is None:
+                        time.sleep(0.01)
 
                 z_mid = tf.convert_to_tensor(z_mid_np, dtype=tf.float32)
 
@@ -682,12 +803,28 @@ class PeerM1M3:
                 # ----- send BWD_REQ -----
                 self._bwd_count += 1
                 dL_dz_mid_np = dL_dz_mid.numpy()
-                payload = encode_message("BWD_REQ", session_id, self.pseudonym, dL_dz_mid_np, self.shared_key)
-                self.board_client.post_message(
-                    sender=self.pseudonym,
-                    receiver=self.target_m2,
-                    payload=payload,
-                )
+                if self.architecture == "board-blind":
+                    payload = encode_message("BWD_REQ", session_id, self.pseudonym, dL_dz_mid_np, self.shared_key)
+                    self.board_client.post_message(
+                        sender=self.pseudonym,
+                        receiver=self.target_m2,
+                        payload=payload,
+                    )
+                else:
+                    payload = encode_message(
+                        "BWD_REQ",
+                        session_id,
+                        sender_pseudo=None,
+                        tensor=dL_dz_mid_np,
+                        key_str=self.shared_key,
+                        target_m2=self.target_m2,
+                    )
+                    self.board_client.post_message(
+                        sender="",
+                        receiver="",
+                        audience=AUDIENCE_TO_M2,
+                        payload=payload,
+                    )
                 if self.verbose and (self._bwd_count % self.log_every == 0):
                     self.logger.info(
                         f"[BWD_REQ #{self._bwd_count}] session={session_id} "
@@ -697,30 +834,41 @@ class PeerM1M3:
                 # ----- wait for BWD_RES -----
                 dL_dz_cut_np = None
                 while dL_dz_cut_np is None:
-                    msg = self.board_client.poll_message(
-                        receiver=self.pseudonym,
-                    )
-                    if msg is None:
+                    if self.architecture == "board-blind":
+                        msgs = []
+                        msg = self.board_client.poll_message(
+                            receiver=self.pseudonym,
+                        )
+                        if msg:
+                            msgs.append(msg)
+                    else:
+                        msgs = self.board_client.poll_pool(AUDIENCE_TO_CLIENTS)
+                    if not msgs:
                         time.sleep(0.01)
                         continue
-                    try:
-                        op, sess, sender_name, tensor = decode_message(msg["payload"], self.shared_key)
-                    except Exception as e:
-                        self.logger.error(f"Failed to decode BWD_RES: {e}")
-                        continue
-                    if op != "BWD_RES" or sess != session_id:
-                        self.logger.warning(
-                            f"Unexpected op='{op}' or session='{sess}' "
-                            f"in BWD_RES for session={session_id}"
-                        )
-                        continue
-                    dL_dz_cut_np = tensor
-                    if self.verbose and (self._bwd_count % self.log_every == 0):
-                        self.logger.info(
-                            f"[BWD_RES #{self._bwd_count}] session={session_id} "
-                            f"from={sender_name}"
-                        )
-                    break
+                    for msg in msgs:
+                        msg_id = msg["msg_id"]
+                        if msg_id in self._seen_msg_ids:
+                            continue
+                        self._seen_msg_ids.add(msg_id)
+                        try:
+                            op, sess, sender_name, tensor, header = decode_message(msg["payload"], self.shared_key)
+                        except Exception as e:
+                            if self.architecture == "single-blind-two-pools":
+                                continue  # not for this client/key
+                            self.logger.error(f"Failed to decode BWD_RES: {e}")
+                            continue
+                        if op != "BWD_RES" or sess != session_id:
+                            continue
+                        dL_dz_cut_np = tensor
+                        if self.verbose and (self._bwd_count % self.log_every == 0):
+                            self.logger.info(
+                                f"[BWD_RES #{self._bwd_count}] session={session_id} "
+                                f"from={sender_name}"
+                            )
+                        break
+                    if dL_dz_cut_np is None:
+                        time.sleep(0.01)
 
                 dL_dz_cut = tf.convert_to_tensor(dL_dz_cut_np, dtype=tf.float32)
 
@@ -773,12 +921,28 @@ class PeerM1M3:
 
             # send INFER_REQ
             self._infer_count += 1
-            payload = encode_message("INFER_REQ", session_id, self.pseudonym, z_cut_np, self.shared_key)
-            self.board_client.post_message(
-                sender=self.pseudonym,
-                receiver=self.target_m2,
-                payload=payload,
-            )
+            if self.architecture == "board-blind":
+                payload = encode_message("INFER_REQ", session_id, self.pseudonym, z_cut_np, self.shared_key)
+                self.board_client.post_message(
+                    sender=self.pseudonym,
+                    receiver=self.target_m2,
+                    payload=payload,
+                )
+            else:
+                payload = encode_message(
+                    "INFER_REQ",
+                    session_id,
+                    sender_pseudo=None,
+                    tensor=z_cut_np,
+                    key_str=self.shared_key,
+                    target_m2=self.target_m2,
+                )
+                self.board_client.post_message(
+                    sender="",
+                    receiver="",
+                    audience=AUDIENCE_TO_M2,
+                    payload=payload,
+                )
             if self.verbose and (self._infer_count % self.log_every == 0):
                 self.logger.info(
                     f"[INFER_REQ #{self._infer_count}] session={session_id} "
@@ -788,30 +952,43 @@ class PeerM1M3:
             # wait for INFER_RES
             z_mid_np = None
             while z_mid_np is None:
-                msg = self.board_client.poll_message(
-                    receiver=self.pseudonym,
-                )
-                if msg is None:
+                if self.architecture == "board-blind":
+                    msgs = []
+                    msg = self.board_client.poll_message(
+                        receiver=self.pseudonym,
+                    )
+                    if msg:
+                        msgs.append(msg)
+                else:
+                    msgs = self.board_client.poll_pool(AUDIENCE_TO_CLIENTS)
+                if not msgs:
                     time.sleep(0.01)
                     continue
-                try:
-                    op, sess, sender_name, tensor = decode_message(msg["payload"], self.shared_key)
-                except Exception as e:
-                    self.logger.error(f"Failed to decode INFER_RES: {e}")
-                    continue
-                if op != "INFER_RES" or sess != session_id:
-                    self.logger.warning(
-                        f"Unexpected op='{op}' or session='{sess}' "
-                        f"in INFER_RES for session={session_id}"
-                    )
-                    continue
-                z_mid_np = tensor
-                if self.verbose and (self._infer_count % self.log_every == 0):
-                    self.logger.info(
-                        f"[INFER_RES #{self._infer_count}] session={session_id} "
-                        f"from={sender_name} shape={z_mid_np.shape}"
-                    )
-                break
+                for msg in msgs:
+                    msg_id = msg["msg_id"]
+                    if msg_id in self._seen_msg_ids:
+                        continue
+                    self._seen_msg_ids.add(msg_id)
+                    try:
+                        op, sess, sender_name, tensor, header = decode_message(msg["payload"], self.shared_key)
+                    except Exception as e:
+                        if self.architecture == "single-blind-two-pools":
+                            continue  # not for this client/key
+                        self.logger.error(f"Failed to decode INFER_RES: {e}")
+                        continue
+                    if op != "INFER_RES" or sess != session_id:
+                        continue
+                    z_mid_np = tensor
+                    if self.verbose and (self._infer_count % self.log_every == 0):
+                        self.logger.info(
+                            f"[INFER_RES #{self._infer_count}] session={session_id} "
+                            f"from={sender_name} shape={z_mid_np.shape}"
+                        )
+                    if self.architecture == "single-blind-two-pools":
+                        self.board_client.ack_message(msg_id=msg_id, audience=AUDIENCE_TO_CLIENTS)
+                    break
+                if z_mid_np is None:
+                    time.sleep(0.01)
 
             z_mid = tf.convert_to_tensor(z_mid_np, dtype=tf.float32)
             logits = self.M3(z_mid, training=False)
@@ -859,13 +1036,20 @@ def main(config_path: str = "config.yaml"):
 
     board_host = general.get("board_host", "localhost")
     board_port = int(general.get("board_port", 50051))
+    architecture = general.get("architecture", "board-blind")
+
+    # Delegate to bucket mode entrypoint
+    if architecture == "single-blind-bucket":
+        from bucket_client import main as bucket_main
+        return bucket_main(config_path)
 
     # ---- Global logger ----
     global_logger = setup_global_logger(run_dir, log_level)
     global_logger.info(f"Run dir: {run_dir}")
     global_logger.info(
         f"Config: epochs={epochs}, batch_size={batch_size}, lr={lr}, "
-        f"m2_verbose={m2_verbose}, m1m3_verbose={m1m3_verbose}, board_addr={board_host}:{board_port}"
+        f"m2_verbose={m2_verbose}, m1m3_verbose={m1m3_verbose}, board_addr={board_host}:{board_port}, "
+        f"architecture={architecture}"
     )
 
     # ---- Control Ray warnings ----
@@ -913,6 +1097,7 @@ def main(config_path: str = "config.yaml"):
             run_dir=run_dir,
             board_host=board_host,
             board_port=board_port,
+            architecture=architecture,
             input_dim=128,
             lr=lr,
             shared_key=key,
@@ -946,6 +1131,7 @@ def main(config_path: str = "config.yaml"):
             y_test=y_test,
             board_host=board_host,
             board_port=board_port,
+            architecture=architecture,
             target_m2=target_m2,
             shared_key=key,
             epochs=epochs,

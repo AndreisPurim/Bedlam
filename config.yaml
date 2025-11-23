@@ -10,6 +10,12 @@ general:
   log_level: "INFO"
   board_host: "localhost"
   board_port: 50051
+  # architecture options:
+  #   board-blind              -> per-receiver queues
+  #   single-blind-two-pools   -> pooled audiences (to_m2, to_clients)
+  #   single-blind-bucket      -> bucket-based board
+  # architecture: "board-blind"
+  architecture: "single-blind-two-pools"
 
   m2_verbose: true
   m2_log_every: 50

@@ -6,6 +6,7 @@ message PostMessageRequest {
   string sender = 1;
   string receiver = 2;
   bytes payload = 3;
+  string audience = 4; // optional: use for pooled delivery instead of receiver
 }
 
 message PostMessageResponse {
@@ -29,7 +30,71 @@ message PollMessageResponse {
   Message message = 2;
 }
 
+message PollPoolRequest {
+  string audience = 1; // e.g., "to_m2" or "to_clients"
+}
+
+message PollPoolResponse {
+  repeated Message messages = 1;
+}
+
+message AckMessageRequest {
+  string msg_id = 1;
+  string audience = 2;
+}
+
+message AckMessageResponse {
+  bool removed = 1;
+}
+
+// ===== Bucket mode messages =====
+message CreateBucketRequest {
+  bytes payload = 1;
+}
+
+message CreateBucketResponse {
+  string bucket_id = 1;
+}
+
+message Bucket {
+  string bucket_id = 1;
+  bytes payload = 2;
+  int64 timestamp_ms = 3;
+}
+
+message PollBucketsRequest {}
+
+message PollBucketsResponse {
+  repeated Bucket buckets = 1;
+}
+
+message UpdateBucketRequest {
+  string bucket_id = 1;
+  bytes payload = 2;
+}
+
+message UpdateBucketResponse {
+  bool updated = 1;
+}
+
+message AckBucketRequest {
+  string bucket_id = 1;
+}
+
+message AckBucketResponse {
+  bool removed = 1;
+}
+
 service BoardService {
   rpc PostMessage(PostMessageRequest) returns (PostMessageResponse);
   rpc PollMessage(PollMessageRequest) returns (PollMessageResponse);
+  rpc PollPool(PollPoolRequest) returns (PollPoolResponse);
+  rpc AckMessage(AckMessageRequest) returns (AckMessageResponse);
+}
+
+service BucketBoard {
+  rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
+  rpc PollBuckets(PollBucketsRequest) returns (PollBucketsResponse);
+  rpc UpdateBucket(UpdateBucketRequest) returns (UpdateBucketResponse);
+  rpc AckBucket(AckBucketRequest) returns (AckBucketResponse);
 }
