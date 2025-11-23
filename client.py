@@ -65,6 +65,7 @@ import yaml
 
 import board_pb2
 import board_pb2_grpc
+from models.factory import build_split_models
 
 # ============================================================
 # 1. Logging helpers
@@ -267,36 +268,6 @@ def decode_message(blob: bytes, key_str: str):
 
 
 # ============================================================
-# 3. Models: M1, M2, M3
-# ============================================================
-
-def build_M1(input_shape=(28, 28, 1)) -> keras.Model:
-    """Early feature extractor (client-side)."""
-    inputs = layers.Input(shape=input_shape)
-    x = layers.Conv2D(16, 3, activation="relu", padding="same")(inputs)
-    x = layers.MaxPooling2D(2)(x)
-    x = layers.Conv2D(32, 3, activation="relu", padding="same")(x)
-    x = layers.MaxPooling2D(2)(x)
-    x = layers.Flatten()(x)
-    x = layers.Dense(128, activation="relu")(x)   # z_cut
-    return models.Model(inputs, x, name="M1")
-
-
-def build_M2(input_dim=128) -> keras.Model:
-    """Middle model (peer holding the 'server' part)."""
-    inputs = layers.Input(shape=(input_dim,))
-    x = layers.Dense(64, activation="relu")(inputs)  # z_mid
-    return models.Model(inputs, x, name="M2")
-
-
-def build_M3(input_dim=64, num_classes=10) -> keras.Model:
-    """Classifier head (back on the client)."""
-    inputs = layers.Input(shape=(input_dim,))
-    outputs = layers.Dense(num_classes, activation="softmax")(inputs)
-    return models.Model(inputs, outputs, name="M3")
-
-
-# ============================================================
 # 4. Data utilities
 # ============================================================
 
@@ -405,6 +376,9 @@ class PeerM2:
         board_host: str,
         board_port: int,
         architecture: str,
+        m1_model: str,
+        m2_model: str,
+        m3_model: str,
         input_dim: int = 128,
         lr: float = 1e-3,
         shared_key: str | None = None,
@@ -416,8 +390,16 @@ class PeerM2:
         self.logger = setup_peer_logger(name, run_dir, log_level)
         self.board_client = GrpcBoardClient(board_host, board_port, logger=self.logger)
         self.architecture = architecture
+        self.m1_model = m1_model
+        self.m2_model = m2_model
+        self.m3_model = m3_model
 
-        self.M2 = build_M2(input_dim=input_dim)
+        _, self.M2, _ = build_split_models(
+            m1_name=self.m1_model,
+            m2_name=self.m2_model,
+            m3_name=self.m3_model,
+            m2_kwargs={"input_dim": input_dim},
+        )
         self.opt_M2 = optimizers.Adam(learning_rate=lr)
         self._sessions: Dict[str, tuple] = {}  # session_id -> (tape, z_cut, z_mid)
 
@@ -432,7 +414,8 @@ class PeerM2:
         self.logger.info(
             f"Initialized PeerM2 with input_dim={input_dim}, lr={lr}, "
             f"verbose={self.verbose}, log_every={self.log_every}, "
-            f"shared_key_len={len(self.shared_key)} board={board_host}:{board_port}"
+            f"shared_key_len={len(self.shared_key)} board={board_host}:{board_port} "
+            f"models(m1/m2/m3)={self.m1_model}/{self.m2_model}/{self.m3_model}"
         )
 
     def run(self):
@@ -633,6 +616,9 @@ class PeerM1M3:
         board_port: int,
         architecture: str,
         target_m2: str,
+        m1_model: str = "default",
+        m2_model: str = "default",
+        m3_model: str = "default",
         shared_key: str | None = None,
         epochs: int = 3,
         batch_size: int = 128,
@@ -650,13 +636,20 @@ class PeerM1M3:
         self.y_test = y_test
         self.board_client = GrpcBoardClient(board_host, board_port, logger=self.logger)
         self.architecture = architecture
+        self.m1_model = m1_model
+        self.m2_model = m2_model
+        self.m3_model = m3_model
         self.target_m2 = target_m2
 
         self.epochs = epochs
         self.batch_size = batch_size
 
-        self.M1 = build_M1()
-        self.M3 = build_M3(input_dim=64)
+        self.M1, _, self.M3 = build_split_models(
+            m1_name=self.m1_model,
+            m2_name=self.m2_model,
+            m3_name=self.m3_model,
+            m3_kwargs={"input_dim": 64},
+        )
         self.opt_M1 = optimizers.Adam(learning_rate=lr)
         self.opt_M3 = optimizers.Adam(learning_rate=lr)
         self.loss_fn = losses.SparseCategoricalCrossentropy()
@@ -681,7 +674,8 @@ class PeerM1M3:
             f"Initialized PeerM1M3 actor_name={self.actor_name} pseudonym={self.pseudonym} "
             f"epochs={epochs} batch_size={batch_size} lr={lr} "
             f"target_m2={target_m2} verbose={self.verbose} log_every={self.log_every} "
-            f"shared_key_len={len(self.shared_key)} board={board_host}:{board_port}"
+            f"shared_key_len={len(self.shared_key)} board={board_host}:{board_port} "
+            f"models(m1/m2/m3)={self.m1_model}/{self.m2_model}/{self.m3_model}"
         )
 
     # ---------------- training ----------------
@@ -1027,6 +1021,13 @@ def main(config_path: str = "config.yaml"):
     lr = float(general.get("lr", 1e-3))
     suppress_warnings = bool(general.get("suppress_warnings", False))
     log_level = general.get("log_level", "INFO")
+    model_arch = general.get("model_architecture", "default")
+    m1_model = model_arch
+    m2_model = model_arch
+    m3_model = model_arch
+    m1_model = general.get("m1_model", "default")
+    m2_model = general.get("m2_model", "default")
+    m3_model = general.get("m3_model", "default")
 
     m2_verbose = bool(general.get("m2_verbose", False))
     m2_log_every = int(general.get("m2_log_every", 50))
@@ -1049,7 +1050,7 @@ def main(config_path: str = "config.yaml"):
     global_logger.info(
         f"Config: epochs={epochs}, batch_size={batch_size}, lr={lr}, "
         f"m2_verbose={m2_verbose}, m1m3_verbose={m1m3_verbose}, board_addr={board_host}:{board_port}, "
-        f"architecture={architecture}"
+        f"architecture={architecture}, model_architecture={model_arch}"
     )
 
     # ---- Control Ray warnings ----
@@ -1098,6 +1099,9 @@ def main(config_path: str = "config.yaml"):
             board_host=board_host,
             board_port=board_port,
             architecture=architecture,
+            m1_model=m1_model,
+            m2_model=m2_model,
+            m3_model=m3_model,
             input_dim=128,
             lr=lr,
             shared_key=key,
@@ -1132,6 +1136,9 @@ def main(config_path: str = "config.yaml"):
             board_host=board_host,
             board_port=board_port,
             architecture=architecture,
+            m1_model=m1_model,
+            m2_model=m2_model,
+            m3_model=m3_model,
             target_m2=target_m2,
             shared_key=key,
             epochs=epochs,

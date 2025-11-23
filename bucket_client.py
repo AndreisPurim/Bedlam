@@ -22,17 +22,13 @@ from typing import Dict, Any
 
 import numpy as np
 import tensorflow as tf
-from tensorflow import keras
-from keras import layers, models, losses, optimizers
+from keras import losses, optimizers
 import ray
 import yaml
 
 from client import (
     encode_message,
     decode_message,
-    build_M1,
-    build_M2,
-    build_M3,
     load_mnist,
     batch_accuracy,
     setup_global_logger,
@@ -40,6 +36,7 @@ from client import (
     AUDIENCE_TO_M2,
     AUDIENCE_TO_CLIENTS,
 )
+from models.factory import build_split_models
 from bucket_board_client import BucketBoardClient
 
 
@@ -55,6 +52,9 @@ class BucketPeerM2:
         run_dir: str,
         board_host: str,
         board_port: int,
+        m1_model: str = "default",
+        m2_model: str = "default",
+        m3_model: str = "default",
         input_dim: int = 128,
         lr: float = 1e-3,
         shared_key: str | None = None,
@@ -65,8 +65,16 @@ class BucketPeerM2:
         self.name = name
         self.logger = setup_peer_logger(name, run_dir, log_level)
         self.board = BucketBoardClient(board_host, board_port)
+        self.m1_model = m1_model
+        self.m2_model = m2_model
+        self.m3_model = m3_model
 
-        self.M2 = build_M2(input_dim=input_dim)
+        _, self.M2, _ = build_split_models(
+            m1_name=self.m1_model,
+            m2_name=self.m2_model,
+            m3_name=self.m3_model,
+            m2_kwargs={"input_dim": input_dim},
+        )
         self.opt_M2 = optimizers.Adam(learning_rate=lr)
         self._sessions: Dict[str, tuple] = {}
         self._seen_bucket_ops: Dict[str, str] = {}
@@ -176,6 +184,9 @@ class BucketPeerM1M3:
         board_host: str,
         board_port: int,
         target_m2: str,
+        m1_model: str = "default",
+        m2_model: str = "default",
+        m3_model: str = "default",
         shared_key: str | None = None,
         epochs: int = 3,
         batch_size: int = 128,
@@ -193,12 +204,19 @@ class BucketPeerM1M3:
         self.y_test = y_test
         self.board = BucketBoardClient(board_host, board_port)
         self.target_m2 = target_m2
+        self.m1_model = m1_model
+        self.m2_model = m2_model
+        self.m3_model = m3_model
 
         self.epochs = epochs
         self.batch_size = batch_size
 
-        self.M1 = build_M1()
-        self.M3 = build_M3(input_dim=64)
+        self.M1, _, self.M3 = build_split_models(
+            m1_name=self.m1_model,
+            m2_name=self.m2_model,
+            m3_name=self.m3_model,
+            m3_kwargs={"input_dim": 64},
+        )
         self.opt_M1 = optimizers.Adam(learning_rate=lr)
         self.opt_M3 = optimizers.Adam(learning_rate=lr)
         self.loss_fn = losses.SparseCategoricalCrossentropy()
@@ -220,7 +238,8 @@ class BucketPeerM1M3:
         self.logger.info(
             f"Initialized BucketPeerM1M3 actor_name={self.actor_name} pseudonym={self.pseudonym} "
             f"epochs={epochs} batch_size={batch_size} lr={lr} target_m2={target_m2} "
-            f"board={board_host}:{board_port} shared_key_len={len(self.shared_key)}"
+            f"board={board_host}:{board_port} shared_key_len={len(self.shared_key)} "
+            f"models(m1/m2/m3)={self.m1_model}/{self.m2_model}/{self.m3_model}"
         )
 
     def train(self):
@@ -397,6 +416,10 @@ def main(config_path: str = "config.yaml"):
     m2_log_every = int(general.get("m2_log_every", 50))
     m1m3_verbose = bool(general.get("m1m3_verbose", False))
     m1m3_log_every = int(general.get("m1m3_log_every", 50))
+    model_arch = general.get("model_architecture", "default")
+    m1_model = model_arch
+    m2_model = model_arch
+    m3_model = model_arch
 
     board_host = general.get("board_host", "localhost")
     board_port = int(general.get("board_port", 50051))  # unified board default
@@ -405,7 +428,8 @@ def main(config_path: str = "config.yaml"):
     global_logger.info(f"Run dir: {run_dir}")
     global_logger.info(
         f"Config: epochs={epochs}, batch_size={batch_size}, lr={lr}, "
-        f"m2_verbose={m2_verbose}, m1m3_verbose={m1m3_verbose}, bucket_board_addr={board_host}:{board_port}"
+        f"m2_verbose={m2_verbose}, m1m3_verbose={m1m3_verbose}, bucket_board_addr={board_host}:{board_port} "
+        f"model_architecture={model_arch}"
     )
 
     os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
@@ -442,6 +466,9 @@ def main(config_path: str = "config.yaml"):
             run_dir=run_dir,
             board_host=board_host,
             board_port=board_port,
+            m1_model=m1_model,
+            m2_model=m2_model,
+            m3_model=m3_model,
             input_dim=128,
             lr=lr,
             shared_key=key,
@@ -472,6 +499,9 @@ def main(config_path: str = "config.yaml"):
             y_test=y_test,
             board_host=board_host,
             board_port=board_port,
+            m1_model=m1_model,
+            m2_model=m2_model,
+            m3_model=m3_model,
             target_m2=target_m2,
             shared_key=key,
             epochs=epochs,
