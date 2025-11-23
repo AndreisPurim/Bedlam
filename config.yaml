@@ -8,6 +8,8 @@ general:
   lr: 0.001
   suppress_warnings: true
   log_level: "INFO"
+  board_host: "localhost"
+  board_port: 50051
 
   m2_verbose: true
   m2_log_every: 50

@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package board;
+
+message PostMessageRequest {
+  string sender = 1;
+  string receiver = 2;
+  bytes payload = 3;
+}
+
+message PostMessageResponse {
+  string msg_id = 1;
+}
+
+message PollMessageRequest {
+  string receiver = 1;
+}
+
+message Message {
+  string msg_id = 1;
+  string sender = 2;
+  string receiver = 3;
+  bytes payload = 4;
+  int64 timestamp_ms = 5;
+}
+
+message PollMessageResponse {
+  bool has_message = 1;
+  Message message = 2;
+}
+
+service BoardService {
+  rpc PostMessage(PostMessageRequest) returns (PostMessageResponse);
+  rpc PollMessage(PollMessageRequest) returns (PollMessageResponse);
+}

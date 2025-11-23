@@ -42,13 +42,12 @@ Privacy-ish features:
 
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"      # suppress TF INFO
-os.environ["CUDA_VISIBLE_DEVICES"] = ""       # force CPU use
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"       # force CPU use
 
 import time
 import uuid
 import logging
 from datetime import datetime
-from collections import defaultdict
 import io
 import json
 import hashlib
@@ -57,11 +56,15 @@ import secrets
 from typing import Dict, Any
 
 import numpy as np
+import grpc
 import tensorflow as tf
 from tensorflow import keras
 from keras import layers, models, losses, optimizers
 import ray
 import yaml
+
+import board_pb2
+import board_pb2_grpc
 
 # ============================================================
 # 1. Logging helpers
@@ -306,94 +309,42 @@ def batch_accuracy(y_true, y_pred):
 
 
 # ============================================================
-# 5. Board actor (kind-oblivious, no session_id)
+# 5. gRPC Board client (for external board_server.py)
 # ============================================================
 
-@ray.remote
-class Board:
+
+class GrpcBoardClient:
     """
-    Central message board.
-
-    Messages are stored in queues keyed by receiver:
-
-        queues[receiver] = [ {msg_id, sender, receiver, payload (bytes), timestamp}, ... ]
-
-    NOTE:
-    - No 'kind' field. Board has no idea if a message is forward/backward/infer.
-    - No 'session_id' field. Session is only inside encrypted header.
-    - 'payload' is opaque ciphertext; only peers with the key can interpret it.
-
-    API:
-      post_message(sender, receiver, payload_bytes) -> msg_id
-      poll_message(receiver) -> message | None
+    Thin client around the gRPC BoardService to match the legacy Board API.
+    Returns/accepts the same dict structure the Ray Board used.
     """
 
-    def __init__(
-        self,
-        name: str,
-        run_dir: str,
-        log_level: str = "INFO",
-        verbose: bool = False,
-        log_every: int = 100,
-    ):
-        self.name = name
-        self.logger = setup_peer_logger(name, run_dir, log_level)
-        self.verbose = verbose
-        self.log_every = max(1, int(log_every))
-        self._post_count = 0
-        self._poll_count = 0
-
-        # queues[receiver] = [message, ...]
-        self.queues: Dict[str, list[Dict[str, Any]]] = defaultdict(list)
-
-        self.logger.info(
-            f"Board initialized with verbose={self.verbose}, log_every={self.log_every}"
-        )
+    def __init__(self, host: str, port: int, logger: logging.Logger | None = None):
+        self.host = host
+        self.port = port
+        self.logger = logger or logging.getLogger("GrpcBoardClient")
+        self.channel = grpc.insecure_channel(f"{host}:{port}")
+        self.stub = board_pb2_grpc.BoardServiceStub(self.channel)
+        self.logger.info("Connected GrpcBoardClient to %s:%d", host, port)
 
     def post_message(self, sender: str, receiver: str, payload: bytes) -> str:
-        """Store a message and return its msg_id."""
-        self._post_count += 1
-        msg_id = uuid.uuid4().hex
-        message = {
-            "msg_id": msg_id,
-            "sender": sender,
-            "receiver": receiver,
-            "payload": payload,   # opaque bytes
-            "timestamp": time.time(),
-        }
-        self.queues[receiver].append(message)
-
-        if self.verbose and (self._post_count % self.log_every == 0):
-            size = len(payload)
-            self.logger.info(
-                f"[POST #{self._post_count}] sender={sender} receiver={receiver} "
-                f"size={size}B msg_id={msg_id}"
-            )
-
-        return msg_id
+        req = board_pb2.PostMessageRequest(sender=sender, receiver=receiver, payload=payload)
+        resp = self.stub.PostMessage(req)
+        return resp.msg_id
 
     def poll_message(self, receiver: str):
-        """
-        Non-blocking poll for a single message for a given receiver.
-
-        Returns and removes the earliest message for that receiver, or None if empty.
-        """
-        self._poll_count += 1
-
-        msgs = self.queues.get(receiver)
-        if not msgs:
+        req = board_pb2.PollMessageRequest(receiver=receiver)
+        resp = self.stub.PollMessage(req)
+        if not resp.has_message:
             return None
-
-        msg = msgs.pop(0)
-
-        if self.verbose and (self._poll_count % self.log_every == 0):
-            size = len(msg["payload"])
-            self.logger.info(
-                f"[POLL #{self._poll_count}] receiver={receiver} "
-                f"msg_id={msg['msg_id']} size={size}B"
-            )
-
-        return msg
+        msg = resp.message
+        return {
+            "msg_id": msg.msg_id,
+            "sender": msg.sender,
+            "receiver": msg.receiver,
+            "payload": bytes(msg.payload),
+            "timestamp": msg.timestamp_ms / 1000.0,
+        }
 
 
 # ============================================================
@@ -420,7 +371,8 @@ class PeerM2:
         self,
         name: str,
         run_dir: str,
-        board,
+        board_host: str,
+        board_port: int,
         input_dim: int = 128,
         lr: float = 1e-3,
         shared_key: str | None = None,
@@ -430,7 +382,7 @@ class PeerM2:
     ):
         self.name = name
         self.logger = setup_peer_logger(name, run_dir, log_level)
-        self.board = board
+        self.board_client = GrpcBoardClient(board_host, board_port, logger=self.logger)
 
         self.M2 = build_M2(input_dim=input_dim)
         self.opt_M2 = optimizers.Adam(learning_rate=lr)
@@ -446,16 +398,14 @@ class PeerM2:
         self.logger.info(
             f"Initialized PeerM2 with input_dim={input_dim}, lr={lr}, "
             f"verbose={self.verbose}, log_every={self.log_every}, "
-            f"shared_key_len={len(self.shared_key)}"
+            f"shared_key_len={len(self.shared_key)} board={board_host}:{board_port}"
         )
 
     def run(self):
         """Main loop: process messages from the Board."""
         self.logger.info("PeerM2.run() loop started.")
         while True:
-            msg = ray.get(self.board.poll_message.remote(
-                receiver=self.name,
-            ))
+            msg = self.board_client.poll_message(receiver=self.name)
             if msg is None:
                 time.sleep(0.01)
                 continue
@@ -493,11 +443,11 @@ class PeerM2:
         z_mid_np = z_mid.numpy()
 
         payload = encode_message("FWD_RES", session_id, self.name, z_mid_np, self.shared_key)
-        ray.get(self.board.post_message.remote(
+        self.board_client.post_message(
             sender=self.name,
             receiver=sender_pseudo,
             payload=payload,
-        ))
+        )
 
         if self.verbose and (self._fwd_count % self.log_every == 0):
             bs = z_cut_np.shape[0]
@@ -526,11 +476,11 @@ class PeerM2:
         dL_dz_cut_np = dL_dz_cut.numpy()
 
         payload = encode_message("BWD_RES", session_id, self.name, dL_dz_cut_np, self.shared_key)
-        ray.get(self.board.post_message.remote(
+        self.board_client.post_message(
             sender=self.name,
             receiver=sender_pseudo,
             payload=payload,
-        ))
+        )
 
         if self.verbose and (self._bwd_count % self.log_every == 0):
             grad_norm = tf.linalg.global_norm(grads_M2).numpy()
@@ -548,11 +498,11 @@ class PeerM2:
         z_mid_np = z_mid.numpy()
 
         payload = encode_message("INFER_RES", session_id, self.name, z_mid_np, self.shared_key)
-        ray.get(self.board.post_message.remote(
+        self.board_client.post_message(
             sender=self.name,
             receiver=sender_pseudo,
             payload=payload,
-        ))
+        )
 
         if self.verbose and (self._infer_count % self.log_every == 0):
             bs = z_cut_np.shape[0]
@@ -592,7 +542,8 @@ class PeerM1M3:
         y_train: np.ndarray,
         x_test: np.ndarray,
         y_test: np.ndarray,
-        board,
+        board_host: str,
+        board_port: int,
         target_m2: str,
         shared_key: str | None = None,
         epochs: int = 3,
@@ -609,7 +560,7 @@ class PeerM1M3:
         self.y_train = y_train
         self.x_test = x_test
         self.y_test = y_test
-        self.board = board
+        self.board_client = GrpcBoardClient(board_host, board_port, logger=self.logger)
         self.target_m2 = target_m2
 
         self.epochs = epochs
@@ -640,7 +591,7 @@ class PeerM1M3:
             f"Initialized PeerM1M3 actor_name={self.actor_name} pseudonym={self.pseudonym} "
             f"epochs={epochs} batch_size={batch_size} lr={lr} "
             f"target_m2={target_m2} verbose={self.verbose} log_every={self.log_every} "
-            f"shared_key_len={len(self.shared_key)}"
+            f"shared_key_len={len(self.shared_key)} board={board_host}:{board_port}"
         )
 
     # ---------------- training ----------------
@@ -674,11 +625,11 @@ class PeerM1M3:
                 # ----- send FWD_REQ envelope -----
                 self._fwd_count += 1
                 payload = encode_message("FWD_REQ", session_id, self.pseudonym, z_cut_np, self.shared_key)
-                ray.get(self.board.post_message.remote(
+                self.board_client.post_message(
                     sender=self.pseudonym,     # Board sees pseudonym
                     receiver=self.target_m2,   # M2 actor name
                     payload=payload,
-                ))
+                )
                 if self.verbose and (self._fwd_count % self.log_every == 0):
                     self.logger.info(
                         f"[FWD_REQ #{self._fwd_count}] session={session_id} "
@@ -688,9 +639,9 @@ class PeerM1M3:
                 # ----- wait for FWD_RES -----
                 z_mid_np = None
                 while z_mid_np is None:
-                    msg = ray.get(self.board.poll_message.remote(
+                    msg = self.board_client.poll_message(
                         receiver=self.pseudonym,   # responses addressed to pseudonym
-                    ))
+                    )
                     if msg is None:
                         time.sleep(0.01)
                         continue
@@ -732,11 +683,11 @@ class PeerM1M3:
                 self._bwd_count += 1
                 dL_dz_mid_np = dL_dz_mid.numpy()
                 payload = encode_message("BWD_REQ", session_id, self.pseudonym, dL_dz_mid_np, self.shared_key)
-                ray.get(self.board.post_message.remote(
+                self.board_client.post_message(
                     sender=self.pseudonym,
                     receiver=self.target_m2,
                     payload=payload,
-                ))
+                )
                 if self.verbose and (self._bwd_count % self.log_every == 0):
                     self.logger.info(
                         f"[BWD_REQ #{self._bwd_count}] session={session_id} "
@@ -746,9 +697,9 @@ class PeerM1M3:
                 # ----- wait for BWD_RES -----
                 dL_dz_cut_np = None
                 while dL_dz_cut_np is None:
-                    msg = ray.get(self.board.poll_message.remote(
+                    msg = self.board_client.poll_message(
                         receiver=self.pseudonym,
-                    ))
+                    )
                     if msg is None:
                         time.sleep(0.01)
                         continue
@@ -823,11 +774,11 @@ class PeerM1M3:
             # send INFER_REQ
             self._infer_count += 1
             payload = encode_message("INFER_REQ", session_id, self.pseudonym, z_cut_np, self.shared_key)
-            ray.get(self.board.post_message.remote(
+            self.board_client.post_message(
                 sender=self.pseudonym,
                 receiver=self.target_m2,
                 payload=payload,
-            ))
+            )
             if self.verbose and (self._infer_count % self.log_every == 0):
                 self.logger.info(
                     f"[INFER_REQ #{self._infer_count}] session={session_id} "
@@ -837,9 +788,9 @@ class PeerM1M3:
             # wait for INFER_RES
             z_mid_np = None
             while z_mid_np is None:
-                msg = ray.get(self.board.poll_message.remote(
+                msg = self.board_client.poll_message(
                     receiver=self.pseudonym,
-                ))
+                )
                 if msg is None:
                     time.sleep(0.01)
                     continue
@@ -906,15 +857,15 @@ def main(config_path: str = "config.yaml"):
     m1m3_verbose = bool(general.get("m1m3_verbose", False))
     m1m3_log_every = int(general.get("m1m3_log_every", 50))
 
-    board_verbose = bool(general.get("board_verbose", False))
-    board_log_every = int(general.get("board_log_every", 100))
+    board_host = general.get("board_host", "localhost")
+    board_port = int(general.get("board_port", 50051))
 
     # ---- Global logger ----
     global_logger = setup_global_logger(run_dir, log_level)
     global_logger.info(f"Run dir: {run_dir}")
     global_logger.info(
         f"Config: epochs={epochs}, batch_size={batch_size}, lr={lr}, "
-        f"m2_verbose={m2_verbose}, m1m3_verbose={m1m3_verbose}, board_verbose={board_verbose}"
+        f"m2_verbose={m2_verbose}, m1m3_verbose={m1m3_verbose}, board_addr={board_host}:{board_port}"
     )
 
     # ---- Control Ray warnings ----
@@ -946,15 +897,7 @@ def main(config_path: str = "config.yaml"):
         key = m2_cfg.get("key", "") or ""
         m2_keys[name] = key
 
-    # ---- Board actor ----
-    board = Board.remote(
-        name="board",
-        run_dir=run_dir,
-        log_level=log_level,
-        verbose=board_verbose,
-        log_every=board_log_every,
-    )
-    global_logger.info("Spawned Board actor.")
+    global_logger.info(f"Using external Board at {board_host}:{board_port}")
 
     # Shard training data across M1M3 peers
     x_shards = np.array_split(x_train, n_clients)
@@ -968,7 +911,8 @@ def main(config_path: str = "config.yaml"):
         m2_peer = PeerM2.remote(
             name=name,
             run_dir=run_dir,
-            board=board,
+            board_host=board_host,
+            board_port=board_port,
             input_dim=128,
             lr=lr,
             shared_key=key,
@@ -1000,7 +944,8 @@ def main(config_path: str = "config.yaml"):
             y_train=y_shards[i],
             x_test=x_test,
             y_test=y_test,
-            board=board,
+            board_host=board_host,
+            board_port=board_port,
             target_m2=target_m2,
             shared_key=key,
             epochs=epochs,
