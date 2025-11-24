@@ -29,6 +29,7 @@ import logging
 from collections import deque
 from concurrent import futures
 import threading
+import time
 
 import grpc
 from cryptography.hazmat.primitives.asymmetric import dh
@@ -36,6 +37,10 @@ from cryptography.hazmat.primitives.asymmetric import dh
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("pairing_server")
+_io_lock = threading.Lock()
+_bytes_in = 0
+_bytes_out = 0
+_io_count = 0
 
 
 # ============================================================
@@ -116,6 +121,24 @@ STATE = PairingState()
 
 
 # ============================================================
+# Background logger
+# ============================================================
+
+
+def _periodic_status_logger(interval_sec: int = 10):
+    while True:
+        time.sleep(interval_sec)
+        with STATE.lock:
+            logger.info(
+                "[status] waiting_clients=%d waiting_m2=%d assigned_clients=%d assigned_m2=%d",
+                len(STATE.waiting_clients),
+                len(STATE.waiting_m2),
+                len(STATE.assign_client),
+                len(STATE.assign_m2),
+            )
+
+
+# ============================================================
 # gRPC helpers (JSON serializers)
 # ============================================================
 
@@ -136,6 +159,21 @@ def _resp(peer_pk: bytes | None):
     return {"assigned": True, "peer_public_key": base64.b64encode(peer_pk).decode("ascii")}
 
 
+def _record_io(in_bytes: int, out_bytes: int):
+    global _bytes_in, _bytes_out, _io_count
+    with _io_lock:
+        _bytes_in += in_bytes
+        _bytes_out += out_bytes
+        _io_count += 1
+        if _io_count % 50 == 0:
+            logger.info(
+                "[bytes] handled=%d bytes_in=%d bytes_out=%d",
+                _io_count,
+                _bytes_in,
+                _bytes_out,
+            )
+
+
 # ============================================================
 # gRPC method implementations
 # ============================================================
@@ -143,53 +181,71 @@ def _resp(peer_pk: bytes | None):
 
 def rpc_dh_params(_: dict) -> dict:
     params = STATE.dh_params.parameter_numbers()
-    return {"p": params.p, "g": params.g}
+    resp = {"p": params.p, "g": params.g}
+    _record_io(len(_serialize({})), len(_serialize(resp)))
+    return resp
 
 
 def rpc_request(payload: dict) -> dict:
     cid = payload.get("client_id", "")
     pk_b64 = payload.get("public_key", "")
     if not cid or not pk_b64:
-        return {"error": "missing client_id/public_key", "assigned": False}
+        resp = {"error": "missing client_id/public_key", "assigned": False}
+        _record_io(len(_serialize(payload)), len(_serialize(resp)))
+        return resp
     pk = base64.b64decode(pk_b64)
     logger.info(f"[pairing] client request received cid={cid}")
     peer_pk = STATE.handle_client_request(cid, pk)
     if peer_pk:
         logger.info(f"[pairing] client cid={cid} matched immediately")
-    return _resp(peer_pk)
+    resp = _resp(peer_pk)
+    _record_io(len(_serialize(payload)), len(_serialize(resp)))
+    return resp
 
 
 def rpc_poll_assignment(payload: dict) -> dict:
     cid = payload.get("client_id", "")
     if not cid:
-        return {"error": "missing client_id", "assigned": False}
+        resp = {"error": "missing client_id", "assigned": False}
+        _record_io(len(_serialize(payload)), len(_serialize(resp)))
+        return resp
     peer_pk = STATE.poll_assignment_client(cid)
     if peer_pk:
         logger.info(f"[pairing] client cid={cid} assignment delivered on poll")
-    return _resp(peer_pk)
+    resp = _resp(peer_pk)
+    _record_io(len(_serialize(payload)), len(_serialize(resp)))
+    return resp
 
 
 def rpc_register_m2(payload: dict) -> dict:
     mid = payload.get("m2_id", "")
     pk_b64 = payload.get("public_key", "")
     if not mid or not pk_b64:
-        return {"error": "missing m2_id/public_key", "assigned": False}
+        resp = {"error": "missing m2_id/public_key", "assigned": False}
+        _record_io(len(_serialize(payload)), len(_serialize(resp)))
+        return resp
     pk = base64.b64decode(pk_b64)
     logger.info(f"[pairing] M2 availability registered mid={mid}")
     peer_pk = STATE.handle_m2_register(mid, pk)
     if peer_pk:
         logger.info(f"[pairing] M2 mid={mid} matched immediately")
-    return _resp(peer_pk)
+    resp = _resp(peer_pk)
+    _record_io(len(_serialize(payload)), len(_serialize(resp)))
+    return resp
 
 
 def rpc_poll_assignment_m2(payload: dict) -> dict:
     mid = payload.get("m2_id", "")
     if not mid:
-        return {"error": "missing m2_id", "assigned": False}
+        resp = {"error": "missing m2_id", "assigned": False}
+        _record_io(len(_serialize(payload)), len(_serialize(resp)))
+        return resp
     peer_pk = STATE.poll_assignment_m2(mid)
     if peer_pk:
         logger.info(f"[pairing] M2 mid={mid} assignment delivered on poll")
-    return _resp(peer_pk)
+    resp = _resp(peer_pk)
+    _record_io(len(_serialize(payload)), len(_serialize(resp)))
+    return resp
 
 
 # ============================================================
@@ -234,6 +290,8 @@ def serve(host: str = "0.0.0.0", port: int = 50052, max_workers: int = 16):
 
     server.add_insecure_port(f"{host}:{port}")
     server.start()
+    t = threading.Thread(target=_periodic_status_logger, args=(10,), daemon=True)
+    t.start()
     logger.info(f"Pairing gRPC server listening on {host}:{port}")
     server.wait_for_termination()
 

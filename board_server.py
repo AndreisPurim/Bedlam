@@ -41,6 +41,8 @@ class BoardStore:
         self._queues: dict[str, deque] = defaultdict(deque)
         self._pools: dict[str, deque] = defaultdict(deque)
         self._pool_index: dict[str, str] = {}  # msg_id -> audience
+        self._bytes_posted = 0
+        self._bytes_polled = 0
 
     def post_message(self, sender: str, receiver: str, payload: bytes, audience: str | None = None) -> str:
         with self._lock:
@@ -53,6 +55,7 @@ class BoardStore:
                 "payload": payload,
                 "timestamp_ms": int(time.time() * 1000),
             }
+            self._bytes_posted += len(payload)
             if audience:
                 self._pools[audience].append(message)
                 self._pool_index[msg_id] = audience
@@ -61,13 +64,14 @@ class BoardStore:
 
         if self.verbose and (self._post_count % self.log_every == 0):
             self.logger.info(
-                "POST #%s sender=%s receiver=%s audience=%s size=%dB msg_id=%s",
+                "POST #%s sender=%s receiver=%s audience=%s size=%dB msg_id=%s total_bytes_posted=%d",
                 self._post_count,
                 sender,
                 receiver,
                 audience or "",
                 len(payload),
                 msg_id,
+                self._bytes_posted,
             )
         return msg_id
 
@@ -78,14 +82,16 @@ class BoardStore:
             if not queue:
                 return None
             msg = queue.popleft()
+            self._bytes_polled += len(msg["payload"])
 
         if self.verbose and (self._poll_count % self.log_every == 0):
             self.logger.info(
-                "POLL #%s receiver=%s msg_id=%s size=%dB",
+                "POLL #%s receiver=%s msg_id=%s size=%dB total_bytes_polled=%d",
                 self._poll_count,
                 receiver,
                 msg["msg_id"],
                 len(msg["payload"]),
+                self._bytes_polled,
             )
         return msg
 
@@ -95,8 +101,14 @@ class BoardStore:
             if not queue:
                 return []
             msgs = list(queue)
+            self._bytes_polled += sum(len(m["payload"]) for m in msgs)
         if self.verbose and msgs and (len(msgs) % self.log_every == 0):
-            self.logger.info("POLL-POOL audience=%s count=%d", audience, len(msgs))
+            self.logger.info(
+                "POLL-POOL audience=%s count=%d total_bytes_polled=%d",
+                audience,
+                len(msgs),
+                self._bytes_polled,
+            )
         return msgs
 
     def ack_message(self, msg_id: str, audience: str | None = None) -> bool:
@@ -202,6 +214,9 @@ class BucketBoardStore:
         self._create_count = 0
         self._poll_count = 0
         self._update_count = 0
+        self._bytes_created = 0
+        self._bytes_polled = 0
+        self._bytes_updated = 0
 
     def create_bucket(self, payload: bytes) -> str:
         self._create_count += 1
@@ -211,15 +226,28 @@ class BucketBoardStore:
             "payload": payload,
             "timestamp_ms": int(time.time() * 1000),
         }
+        self._bytes_created += len(payload)
         if self.verbose and (self._create_count % self.log_every == 0):
-            self.logger.info("CREATE #%s bucket_id=%s size=%dB", self._create_count, bucket_id, len(payload))
+            self.logger.info(
+                "CREATE #%s bucket_id=%s size=%dB total_bytes_created=%d",
+                self._create_count,
+                bucket_id,
+                len(payload),
+                self._bytes_created,
+            )
         return bucket_id
 
     def poll_buckets(self):
         self._poll_count += 1
         buckets = list(self._buckets.values())
+        self._bytes_polled += sum(len(b["payload"]) for b in buckets)
         if self.verbose and buckets and (self._poll_count % self.log_every == 0):
-            self.logger.info("POLL #%s count=%d", self._poll_count, len(buckets))
+            self.logger.info(
+                "POLL #%s count=%d total_bytes_polled=%d",
+                self._poll_count,
+                len(buckets),
+                self._bytes_polled,
+            )
         return buckets
 
     def update_bucket(self, bucket_id: str, payload: bytes) -> bool:
@@ -231,8 +259,15 @@ class BucketBoardStore:
             "payload": payload,
             "timestamp_ms": int(time.time() * 1000),
         }
+        self._bytes_updated += len(payload)
         if self.verbose and (self._update_count % self.log_every == 0):
-            self.logger.info("UPDATE #%s bucket_id=%s size=%dB", self._update_count, bucket_id, len(payload))
+            self.logger.info(
+                "UPDATE #%s bucket_id=%s size=%dB total_bytes_updated=%d",
+                self._update_count,
+                bucket_id,
+                len(payload),
+                self._bytes_updated,
+            )
         return True
 
     def ack_bucket(self, bucket_id: str) -> bool:

@@ -14,17 +14,19 @@ general:
   pairing_port: 50052
   # model architectures: default | mlp | deep | resnet-lite
   # model_architecture: "mlp"
-  # model_architecture: "default"
-  model_architecture: "mlp"
+  model_architecture: "default"
+  # model_architecture: "mlp"
   pad_multiple: 1024
 
   # architecture options:
+  #   vanilla-split          -> baseline split learning (Ray direct, no board)
   #   board-blind              -> per-receiver queues
   #   single-blind-two-pools   -> pooled audiences (to_m2, to_clients)
   #   single-blind-bucket      -> bucket-based board
   #   double-blind             -> dynamic pairing via DH + bucket board
   # architecture: "single-blind-bucket"
-  architecture: "double-blind"
+  # architecture: "double-blind"
+  architecture: "vanilla-split"
 
   m2_verbose: true
   m2_log_every: 50
@@ -38,7 +40,7 @@ general:
 double_blind:
   # number of peers for the double-blind approach (ignores peers.M1M3/M2)
   m1m3_count: 3
-  m2_count: 2
+  m2_count: 3
 
 peers:
   M2:

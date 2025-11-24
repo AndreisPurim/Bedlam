@@ -200,6 +200,9 @@ class DoubleBlindPeerM2:
         self._public_key_bytes = None
         self._shared_key_hex = None
 
+        self.bytes_sent = 0
+        self.bytes_received = 0
+
         self.logger.info(
             f"Initialized DoubleBlindPeerM2 board={board_host}:{board_port} pairing={pairing_host}:{pairing_port} pad={pad_multiple} lr={lr}"
         )
@@ -245,6 +248,7 @@ class DoubleBlindPeerM2:
 
             for b in buckets:
                 bid = b["bucket_id"]
+                self.bytes_received += len(b["payload"])
                 try:
                     op, session, sender, tensor, header = decode_message(b["payload"], self._shared_key_hex)
                 except Exception:
@@ -265,6 +269,13 @@ class DoubleBlindPeerM2:
                     self._handle_backward(bid, session, tensor)
                 elif op == "INFER_REQ":
                     self._handle_infer(bid, session, tensor)
+
+            total_ops = self._fwd_count + self._bwd_count + self._infer_count
+            if total_ops and (total_ops % self.log_every == 0):
+                self.logger.info(
+                    f"[bytes] sent={self.bytes_sent}B recv={self.bytes_received}B "
+                    f"fwd={self._fwd_count} bwd={self._bwd_count} infer={self._infer_count}"
+                )
 
     def _cleanup_session(self):
         self._sessions.clear()
@@ -291,6 +302,7 @@ class DoubleBlindPeerM2:
             pad_multiple=self.pad_multiple,
         )
         self.board.update_bucket(bucket_id, resp)
+        self.bytes_sent += len(resp)
 
     def _handle_backward(self, bucket_id: str, session_id: str, dL_dz_mid_np: np.ndarray):
         if session_id not in self._sessions:
@@ -314,6 +326,7 @@ class DoubleBlindPeerM2:
             pad_multiple=self.pad_multiple,
         )
         self.board.update_bucket(bucket_id, resp)
+        self.bytes_sent += len(resp)
 
     def _handle_infer(self, bucket_id: str, session_id: str, z_cut_np: np.ndarray):
         z_cut = tf.convert_to_tensor(z_cut_np, dtype=tf.float32)
@@ -329,6 +342,7 @@ class DoubleBlindPeerM2:
             pad_multiple=self.pad_multiple,
         )
         self.board.update_bucket(bucket_id, resp)
+        self.bytes_sent += len(resp)
 
 
 # ============================================================
@@ -396,6 +410,9 @@ class DoubleBlindPeerM1M3:
         self._private_key = None
         self._shared_key_hex = None
 
+        self.bytes_sent = 0
+        self.bytes_received = 0
+
         self.metrics_path = os.path.join(run_dir, f"metrics_{self.actor_name}.csv")
         with open(self.metrics_path, "w") as f:
             f.write("epoch,step,loss,acc\n")
@@ -441,6 +458,12 @@ class DoubleBlindPeerM1M3:
         self.logger.info(f"Starting training on {n} samples, {steps_per_epoch} steps/epoch.")
 
         for epoch in range(1, self.epochs + 1):
+            sent_start = self.bytes_sent
+            recv_start = self.bytes_received
+            fwd_start = self._fwd_count
+            bwd_start = self._bwd_count
+            infer_start = self._infer_count
+
             idx = np.random.permutation(n)
             x_sh = self.x_train[idx]
             y_sh = self.y_train[idx]
@@ -470,6 +493,7 @@ class DoubleBlindPeerM1M3:
                     pad_multiple=self.pad_multiple,
                 )
                 bucket_id = self.board.create_bucket(payload)
+                self.bytes_sent += len(payload)
 
                 z_mid_np = self._wait_for_response(bucket_id, session_id, "FWD_RES")
                 z_mid = tf.convert_to_tensor(z_mid_np, dtype=tf.float32)
@@ -496,6 +520,7 @@ class DoubleBlindPeerM1M3:
                     pad_multiple=self.pad_multiple,
                 )
                 self.board.update_bucket(bucket_id, payload)
+                self.bytes_sent += len(payload)
 
                 dL_dz_cut_np = self._wait_for_response(bucket_id, session_id, "BWD_RES")
                 self.board.ack_bucket(bucket_id)
@@ -521,9 +546,17 @@ class DoubleBlindPeerM1M3:
             mean_acc = float(np.mean(epoch_accs))
             elapsed = time.time() - start
             self.logger.info(f"Epoch {epoch} done in {elapsed:.1f}s → Loss={mean_loss:.4f} Acc={mean_acc:.4f}")
+            self.logger.info(
+                f"[bytes-epoch] epoch={epoch} sent={self.bytes_sent - sent_start}B recv={self.bytes_received - recv_start}B "
+                f"fwd={self._fwd_count - fwd_start} bwd={self._bwd_count - bwd_start} infer={self._infer_count - infer_start}"
+            )
 
         # Release M2 for reuse before evaluation so queued peers can pair
         self._send_session_done()
+        self.logger.info(
+            f"[bytes-summary] sent={self.bytes_sent}B recv={self.bytes_received}B "
+            f"fwd={self._fwd_count} bwd={self._bwd_count} infer={self._infer_count}"
+        )
         return f"{self.actor_name} training finished."
 
     def _wait_for_response(self, bucket_id: str, session_id: str, expect_op: str, timeout_sec: float | None = None):
@@ -537,6 +570,7 @@ class DoubleBlindPeerM1M3:
             for b in buckets:
                 if b["bucket_id"] != bucket_id:
                     continue
+                self.bytes_received += len(b["payload"])
                 try:
                     op, sess, sender, tensor, header = decode_message(b["payload"], self._shared_key_hex)
                 except Exception:
@@ -586,11 +620,13 @@ class DoubleBlindPeerM1M3:
                         pad_multiple=self.pad_multiple,
                     )
                     bucket_id = self.board.create_bucket(payload)
+                    self.bytes_sent += len(payload)
                     self.logger.info(
                         f"[eval] sent INFER_REQ session={session_id} bucket={bucket_id} batch={z_cut_np.shape[0]}"
                     )
 
                     z_mid_np = self._wait_for_response(bucket_id, session_id, "INFER_RES", timeout_sec=120)
+                    print("------------aqui------------")
                     self.board.ack_bucket(bucket_id)
                     break
                 except TimeoutError as e:
@@ -613,6 +649,10 @@ class DoubleBlindPeerM1M3:
         acc = batch_accuracy(self.y_test, logits_full)
         self.logger.info(f"Test accuracy: {acc:.4f}")
         self._send_session_done()
+        self.logger.info(
+            f"[bytes-summary] sent={self.bytes_sent}B recv={self.bytes_received}B "
+            f"fwd={self._fwd_count} bwd={self._bwd_count} infer={self._infer_count}"
+        )
         return float(acc)
 
     def _send_session_done(self):
@@ -630,6 +670,7 @@ class DoubleBlindPeerM1M3:
         )
         self.board.create_bucket(payload)
         self._shared_key_hex = None
+        self.bytes_sent += len(payload)
 
 
 # ============================================================

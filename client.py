@@ -421,6 +421,9 @@ class PeerM2:
         self._infer_count = 0
         self._seen_msg_ids: set[str] = set()  # dedup when pooling
 
+        self.bytes_sent = 0
+        self.bytes_received = 0
+
         self.logger.info(
             f"Initialized PeerM2 with input_dim={input_dim}, lr={lr}, "
             f"verbose={self.verbose}, log_every={self.log_every}, "
@@ -449,6 +452,7 @@ class PeerM2:
                 if msg_id in self._seen_msg_ids:
                     continue
                 self._seen_msg_ids.add(msg_id)
+                self.bytes_received += len(msg["payload"])
 
                 try:
                     op, session, sender_pseudo, tensor, header = decode_message(
@@ -485,6 +489,15 @@ class PeerM2:
                     # Acknowledge consumption of this request so Board can shrink the pool.
                     self.board_client.ack_message(msg_id=msg_id, audience=AUDIENCE_TO_M2)
 
+            # periodic bandwidth log
+            if (self._fwd_count + self._bwd_count + self._infer_count) and (
+                (self._fwd_count + self._bwd_count + self._infer_count) % self.log_every == 0
+            ):
+                self.logger.info(
+                    f"[bytes] sent={self.bytes_sent}B recv={self.bytes_received}B "
+                    f"fwd={self._fwd_count} bwd={self._bwd_count} infer={self._infer_count}"
+                )
+
     # ---------------- internal handlers ----------------
 
     def _handle_forward(self, session_id: str, sender_pseudo: str, z_cut_np: np.ndarray):
@@ -512,6 +525,7 @@ class PeerM2:
                 audience=AUDIENCE_TO_CLIENTS,
                 payload=payload,
             )
+        self.bytes_sent += len(payload)
 
         if self.verbose and (self._fwd_count % self.log_every == 0):
             bs = z_cut_np.shape[0]
@@ -553,6 +567,7 @@ class PeerM2:
                 audience=AUDIENCE_TO_CLIENTS,
                 payload=payload,
             )
+        self.bytes_sent += len(payload)
 
         if self.verbose and (self._bwd_count % self.log_every == 0):
             grad_norm = tf.linalg.global_norm(grads_M2).numpy()
@@ -583,6 +598,7 @@ class PeerM2:
                 audience=AUDIENCE_TO_CLIENTS,
                 payload=payload,
             )
+        self.bytes_sent += len(payload)
 
         if self.verbose and (self._infer_count % self.log_every == 0):
             bs = z_cut_np.shape[0]
@@ -682,6 +698,9 @@ class PeerM1M3:
         with open(self.metrics_path, "w") as f:
             f.write("epoch,step,loss,acc\n")
 
+        self.bytes_sent = 0
+        self.bytes_received = 0
+
         self.logger.info(
             f"Initialized PeerM1M3 actor_name={self.actor_name} pseudonym={self.pseudonym} "
             f"epochs={epochs} batch_size={batch_size} lr={lr} "
@@ -698,6 +717,12 @@ class PeerM1M3:
         self.logger.info(f"Starting training on {n} samples, {steps_per_epoch} steps/epoch.")
 
         for epoch in range(1, self.epochs + 1):
+            sent_start = self.bytes_sent
+            recv_start = self.bytes_received
+            fwd_start = self._fwd_count
+            bwd_start = self._bwd_count
+            infer_start = self._infer_count
+
             idx = np.random.permutation(n)
             x_sh = self.x_train[idx]
             y_sh = self.y_train[idx]
@@ -727,6 +752,7 @@ class PeerM1M3:
                         receiver=self.target_m2,   # M2 actor name
                         payload=payload,
                     )
+                    self.bytes_sent += len(payload)
                 else:
                     payload = encode_message(
                         "FWD_REQ",
@@ -743,6 +769,7 @@ class PeerM1M3:
                         audience=AUDIENCE_TO_M2,
                         payload=payload,
                     )
+                    self.bytes_sent += len(payload)
                 if self.verbose and (self._fwd_count % self.log_every == 0):
                     self.logger.info(
                         f"[FWD_REQ #{self._fwd_count}] session={session_id} "
@@ -769,6 +796,7 @@ class PeerM1M3:
                         if msg_id in self._seen_msg_ids:
                             continue
                         self._seen_msg_ids.add(msg_id)
+                        self.bytes_received += len(msg["payload"])
                         try:
                             op, sess, sender_name, tensor, header = decode_message(msg["payload"], self.shared_key)
                         except Exception as e:
@@ -817,6 +845,7 @@ class PeerM1M3:
                         receiver=self.target_m2,
                         payload=payload,
                     )
+                    self.bytes_sent += len(payload)
                 else:
                     payload = encode_message(
                         "BWD_REQ",
@@ -833,6 +862,7 @@ class PeerM1M3:
                         audience=AUDIENCE_TO_M2,
                         payload=payload,
                     )
+                    self.bytes_sent += len(payload)
                 if self.verbose and (self._bwd_count % self.log_every == 0):
                     self.logger.info(
                         f"[BWD_REQ #{self._bwd_count}] session={session_id} "
@@ -859,6 +889,7 @@ class PeerM1M3:
                         if msg_id in self._seen_msg_ids:
                             continue
                         self._seen_msg_ids.add(msg_id)
+                        self.bytes_received += len(msg["payload"])
                         try:
                             op, sess, sender_name, tensor, header = decode_message(msg["payload"], self.shared_key)
                         except Exception as e:
@@ -909,7 +940,15 @@ class PeerM1M3:
                 f"Epoch {epoch} done in {elapsed:.1f}s "
                 f"→ Loss={mean_loss:.4f} Acc={mean_acc:.4f}"
             )
+            self.logger.info(
+                f"[bytes-epoch] epoch={epoch} sent={self.bytes_sent - sent_start}B recv={self.bytes_received - recv_start}B "
+                f"fwd={self._fwd_count - fwd_start} bwd={self._bwd_count - bwd_start} infer={self._infer_count - infer_start}"
+            )
 
+        self.logger.info(
+            f"[bytes-summary] sent={self.bytes_sent}B recv={self.bytes_received}B "
+            f"fwd={self._fwd_count} bwd={self._bwd_count} infer={self._infer_count}"
+        )
         return f"{self.actor_name} training finished."
 
     # ---------------- evaluation ----------------
@@ -936,6 +975,7 @@ class PeerM1M3:
                     receiver=self.target_m2,
                     payload=payload,
                 )
+                self.bytes_sent += len(payload)
             else:
                 payload = encode_message(
                     "INFER_REQ",
@@ -952,6 +992,7 @@ class PeerM1M3:
                     audience=AUDIENCE_TO_M2,
                     payload=payload,
                 )
+                self.bytes_sent += len(payload)
             if self.verbose and (self._infer_count % self.log_every == 0):
                 self.logger.info(
                     f"[INFER_REQ #{self._infer_count}] session={session_id} "
@@ -978,6 +1019,7 @@ class PeerM1M3:
                     if msg_id in self._seen_msg_ids:
                         continue
                     self._seen_msg_ids.add(msg_id)
+                    self.bytes_received += len(msg["payload"])
                     try:
                         op, sess, sender_name, tensor, header = decode_message(msg["payload"], self.shared_key)
                     except Exception as e:
@@ -1006,6 +1048,10 @@ class PeerM1M3:
         logits_full = np.concatenate(all_logits, axis=0)[:n]
         acc = batch_accuracy(self.y_test, logits_full)
         self.logger.info(f"Test accuracy: {acc:.4f}")
+        self.logger.info(
+            f"[bytes-summary] sent={self.bytes_sent}B recv={self.bytes_received}B "
+            f"fwd={self._fwd_count} bwd={self._bwd_count} infer={self._infer_count}"
+        )
         return float(acc)
 
 
@@ -1053,6 +1099,11 @@ def main(config_path: str = "config.yaml"):
     board_host = general.get("board_host", "localhost")
     board_port = int(general.get("board_port", 50051))
     architecture = general.get("architecture", "board-blind")
+
+    # Delegate to vanilla split-learning entrypoint (no board)
+    if architecture in ("vanilla-split", "vanilla", "default-split"):
+        from vanilla_split import main as vanilla_main
+        return vanilla_main(config_path)
 
     # Delegate to bucket mode entrypoint
     if architecture == "single-blind-bucket":

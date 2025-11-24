@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-bucket_client.py — variant of client.py using the bucket-based board.
+vanilla_split.py — baseline split learning with Ray actors (no board).
 
-Flow:
- - M1M3 creates a bucket with an encrypted request (no client identifier).
- - M2 polls all buckets, decrypts what it can, processes only buckets targeting it,
-   and updates the same bucket payload with the response.
- - M1M3 polls all buckets, decrypts, and when it finds the matching response,
-   it acks the bucket to delete it.
+This is the "default" split-learning strategy from Lab-08, adapted to use Ray
+actors for the M2 server and the M1+M3 clients.
+
+Logging/outputs:
+ - global.log under the run directory
+ - one log file per peer (M2 + each client)
+ - per-client metrics CSV: metrics_<client>.csv
 """
 
 import os
+
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+import logging
 import time
 import uuid
-import logging
 from datetime import datetime
 from typing import Dict, Any
 
@@ -26,50 +28,35 @@ from keras import losses, optimizers
 import ray
 import yaml
 
-from client import (
-    encode_message,
-    decode_message,
-    load_mnist,
-    batch_accuracy,
-    setup_global_logger,
-    setup_peer_logger,
-    AUDIENCE_TO_M2,
-    AUDIENCE_TO_CLIENTS,
-)
+from client import load_mnist, batch_accuracy, setup_global_logger, setup_peer_logger
 from models.factory import build_split_models
-from bucket_board_client import BucketBoardClient
 
 
 # ============================================================
-# Ray peer: M2 holder with bucket board
+# Ray peer: M2 server (middle model)
 # ============================================================
+
 
 @ray.remote
-class BucketPeerM2:
+class VanillaPeerM2:
     def __init__(
         self,
         name: str,
         run_dir: str,
-        board_host: str,
-        board_port: int,
         m1_model: str = "default",
         m2_model: str = "default",
         m3_model: str = "default",
-        pad_multiple: int = 1024,
         input_dim: int = 128,
         lr: float = 1e-3,
-        shared_key: str | None = None,
         log_level: str = "INFO",
         verbose: bool = False,
         log_every: int = 50,
     ):
         self.name = name
         self.logger = setup_peer_logger(name, run_dir, log_level)
-        self.board = BucketBoardClient(board_host, board_port)
         self.m1_model = m1_model
         self.m2_model = m2_model
         self.m3_model = m3_model
-        self.pad_multiple = pad_multiple
 
         _, self.M2, _ = build_split_models(
             m1_name=self.m1_model,
@@ -79,84 +66,49 @@ class BucketPeerM2:
         )
         self.opt_M2 = optimizers.Adam(learning_rate=lr)
         self._sessions: Dict[str, tuple] = {}
-        self._seen_bucket_ops: Dict[str, str] = {}
 
-        self.shared_key = shared_key or ""
         self.verbose = verbose
         self.log_every = max(1, int(log_every))
         self._fwd_count = 0
         self._bwd_count = 0
         self._infer_count = 0
+
         self.bytes_sent = 0
         self.bytes_received = 0
 
         self.logger.info(
-            f"Initialized BucketPeerM2 input_dim={input_dim} lr={lr} board={board_host}:{board_port} "
-            f"shared_key_len={len(self.shared_key)}"
+            f"Initialized VanillaPeerM2 input_dim={input_dim} lr={lr} "
+            f"models(m1/m2/m3)={self.m1_model}/{self.m2_model}/{self.m3_model}"
         )
 
-    def run(self):
-        self.logger.info("BucketPeerM2.run loop started.")
-        while True:
-            buckets = self.board.poll_buckets()
-            if not buckets:
-                time.sleep(0.01)
-                continue
-
-            for b in buckets:
-                bid = b["bucket_id"]
-                payload = b["payload"]
-                self.bytes_received += len(payload)
-
-                try:
-                    op, session, sender, tensor, header = decode_message(payload, self.shared_key)
-                except Exception:
-                    # not for this M2/key
-                    continue
-
-                target = header.get("target_m2")
-                if target and target != self.name:
-                    continue
-
-                # Remember last seen op for this bucket
-                self._seen_bucket_ops[bid] = op
-
-                if op == "FWD_REQ":
-                    self._handle_forward(bid, session, tensor)
-                elif op == "BWD_REQ":
-                    self._handle_backward(bid, session, tensor)
-                elif op == "INFER_REQ":
-                    self._handle_infer(bid, session, tensor)
-                else:
-                    continue
-
-            if (self._fwd_count + self._bwd_count + self._infer_count) and (
-                (self._fwd_count + self._bwd_count + self._infer_count) % self.log_every == 0
-            ):
-                self.logger.info(
-                    f"[bytes] sent={self.bytes_sent}B recv={self.bytes_received}B "
-                    f"fwd={self._fwd_count} bwd={self._bwd_count} infer={self._infer_count}"
-                )
-
-    def _handle_forward(self, bucket_id: str, session_id: str, z_cut_np: np.ndarray):
+    def forward(self, session_id: str, z_cut_np: np.ndarray):
         self._fwd_count += 1
+        self.bytes_received += z_cut_np.nbytes
         z_cut = tf.convert_to_tensor(z_cut_np, dtype=tf.float32)
         with tf.GradientTape() as tape:
             tape.watch(z_cut)
             z_mid = self.M2(z_cut, training=True)
         self._sessions[session_id] = (tape, z_cut, z_mid)
+        if self.verbose and (self._fwd_count % self.log_every == 0):
+            bs = z_cut_np.shape[0]
+            feat_dim = z_cut_np.shape[1] if z_cut_np.ndim > 1 else 1
+            self.logger.info(
+                f"[FWD #{self._fwd_count}] session={session_id} batch={bs} feat_dim={feat_dim}"
+            )
+        if self._fwd_count % self.log_every == 0:
+            self.logger.info(
+                f"[bytes] sent={self.bytes_sent}B recv={self.bytes_received}B fwd={self._fwd_count}"
+            )
         z_mid_np = z_mid.numpy()
+        self.bytes_sent += z_mid_np.nbytes
+        return z_mid_np
 
-        resp = encode_message("FWD_RES", session_id, self.name, z_mid_np, self.shared_key, target_m2=self.name, pad_multiple=self.pad_multiple)
-        self.board.update_bucket(bucket_id, resp)
-        self._seen_bucket_ops[bucket_id] = "FWD_RES"
-        self.bytes_sent += len(resp)
-
-    def _handle_backward(self, bucket_id: str, session_id: str, dL_dz_mid_np: np.ndarray):
+    def backward(self, session_id: str, dL_dz_mid_np: np.ndarray):
         self._bwd_count += 1
+        self.bytes_received += dL_dz_mid_np.nbytes
         if session_id not in self._sessions:
             self.logger.error(f"[BWD] no cached forward for session={session_id}")
-            return
+            return None
         tape, z_cut, z_mid = self._sessions.pop(session_id)
         dL_dz_mid = tf.convert_to_tensor(dL_dz_mid_np, dtype=tf.float32)
         targets = self.M2.trainable_variables + [z_cut]
@@ -164,31 +116,47 @@ class BucketPeerM2:
         grads_M2 = grads_all[:-1]
         dL_dz_cut = grads_all[-1]
         self.opt_M2.apply_gradients(zip(grads_M2, self.M2.trainable_variables))
+        if self.verbose and (self._bwd_count % self.log_every == 0):
+            grad_norm = tf.linalg.global_norm(grads_M2).numpy()
+            dzcut_norm = tf.linalg.global_norm([dL_dz_cut]).numpy()
+            self.logger.info(
+                f"[BWD #{self._bwd_count}] session={session_id} grad_norm(M2)={grad_norm:.4f} "
+                f"grad_norm(dL/dz_cut)={dzcut_norm:.4f}"
+            )
+        if self._bwd_count % self.log_every == 0:
+            self.logger.info(
+                f"[bytes] sent={self.bytes_sent}B recv={self.bytes_received}B "
+                f"fwd={self._fwd_count} bwd={self._bwd_count} infer={self._infer_count}"
+            )
         dL_dz_cut_np = dL_dz_cut.numpy()
+        self.bytes_sent += dL_dz_cut_np.nbytes
+        return dL_dz_cut_np
 
-        resp = encode_message("BWD_RES", session_id, self.name, dL_dz_cut_np, self.shared_key, target_m2=self.name, pad_multiple=self.pad_multiple)
-        self.board.update_bucket(bucket_id, resp)
-        self._seen_bucket_ops[bucket_id] = "BWD_RES"
-        self.bytes_sent += len(resp)
-
-    def _handle_infer(self, bucket_id: str, session_id: str, z_cut_np: np.ndarray):
+    def infer(self, session_id: str, z_cut_np: np.ndarray):
         self._infer_count += 1
+        self.bytes_received += z_cut_np.nbytes
         z_cut = tf.convert_to_tensor(z_cut_np, dtype=tf.float32)
         z_mid = self.M2(z_cut, training=False)
+        if self.verbose and (self._infer_count % self.log_every == 0):
+            bs = z_cut_np.shape[0]
+            self.logger.info(f"[INFER #{self._infer_count}] session={session_id} batch={bs}")
+        if self._infer_count % self.log_every == 0:
+            self.logger.info(
+                f"[bytes] sent={self.bytes_sent}B recv={self.bytes_received}B "
+                f"fwd={self._fwd_count} bwd={self._bwd_count} infer={self._infer_count}"
+            )
         z_mid_np = z_mid.numpy()
-
-        resp = encode_message("INFER_RES", session_id, self.name, z_mid_np, self.shared_key, target_m2=self.name, pad_multiple=self.pad_multiple)
-        self.board.update_bucket(bucket_id, resp)
-        self._seen_bucket_ops[bucket_id] = "INFER_RES"
-        self.bytes_sent += len(resp)
+        self.bytes_sent += z_mid_np.nbytes
+        return z_mid_np
 
 
 # ============================================================
-# Ray peer: M1+M3 client with bucket board
+# Ray peer: M1 + M3 client
 # ============================================================
+
 
 @ray.remote
-class BucketPeerM1M3:
+class VanillaPeerM1M3:
     def __init__(
         self,
         name: str,
@@ -197,14 +165,11 @@ class BucketPeerM1M3:
         y_train: np.ndarray,
         x_test: np.ndarray,
         y_test: np.ndarray,
-        board_host: str,
-        board_port: int,
-        target_m2: str,
+        m2_actor,
+        m2_name: str,
         m1_model: str = "default",
         m2_model: str = "default",
         m3_model: str = "default",
-        pad_multiple: int = 1024,
-        shared_key: str | None = None,
         epochs: int = 3,
         batch_size: int = 128,
         lr: float = 1e-3,
@@ -219,13 +184,12 @@ class BucketPeerM1M3:
         self.y_train = y_train
         self.x_test = x_test
         self.y_test = y_test
-        self.board = BucketBoardClient(board_host, board_port)
-        self.target_m2 = target_m2
+        self.m2_actor = m2_actor
+        self.m2_name = m2_name
+
         self.m1_model = m1_model
         self.m2_model = m2_model
         self.m3_model = m3_model
-        self.pad_multiple = pad_multiple
-        self.pad_multiple = pad_multiple
 
         self.epochs = epochs
         self.batch_size = batch_size
@@ -240,29 +204,26 @@ class BucketPeerM1M3:
         self.opt_M3 = optimizers.Adam(learning_rate=lr)
         self.loss_fn = losses.SparseCategoricalCrossentropy()
 
-        self.shared_key = shared_key or ""
         self.verbose = verbose
         self.log_every = max(1, int(log_every))
         self._fwd_count = 0
         self._bwd_count = 0
         self._infer_count = 0
-        self._seen_buckets: set[str] = set()
 
-        self.pseudonym = f"cli_{uuid.uuid4().hex[:8]}"
+        self.bytes_sent = 0
+        self.bytes_received = 0
 
         self.metrics_path = os.path.join(run_dir, f"metrics_{self.actor_name}.csv")
         with open(self.metrics_path, "w") as f:
             f.write("epoch,step,loss,acc\n")
 
-        self.bytes_sent = 0
-        self.bytes_received = 0
-
         self.logger.info(
-            f"Initialized BucketPeerM1M3 actor_name={self.actor_name} pseudonym={self.pseudonym} "
-            f"epochs={epochs} batch_size={batch_size} lr={lr} target_m2={target_m2} "
-            f"board={board_host}:{board_port} shared_key_len={len(self.shared_key)} "
+            f"Initialized VanillaPeerM1M3 actor_name={self.actor_name} target_m2={self.m2_name} "
+            f"epochs={epochs} batch_size={batch_size} lr={lr} "
             f"models(m1/m2/m3)={self.m1_model}/{self.m2_model}/{self.m3_model}"
         )
+
+    # ---------------- training ----------------
 
     def train(self):
         n = len(self.x_train)
@@ -292,28 +253,20 @@ class BucketPeerM1M3:
                 with tf.GradientTape(persistent=True) as tape_M1:
                     z_cut = self.M1(xb, training=True)
                 z_cut_np = z_cut.numpy()
+                self.bytes_sent += z_cut_np.nbytes
 
                 session_id = f"{self.actor_name}-train-{epoch}-{step}-{uuid.uuid4().hex}"
 
-                # Create bucket with FWD_REQ
                 self._fwd_count += 1
-                payload = encode_message(
-                    "FWD_REQ",
-                    session_id,
-                    sender_pseudo=None,
-                    tensor=z_cut_np,
-                    key_str=self.shared_key,
-                    target_m2=self.target_m2,
-                    pad_multiple=self.pad_multiple,
-                )
-                bucket_id = self.board.create_bucket(payload)
-                self.bytes_sent += len(payload)
+                z_mid_np = ray.get(self.m2_actor.forward.remote(session_id, z_cut_np))
+                self.bytes_received += z_mid_np.nbytes
+                if self.verbose and (self._fwd_count % self.log_every == 0):
+                    self.logger.info(
+                        f"[FWD_REQ #{self._fwd_count}] session={session_id} to={self.m2_name} batch={z_cut_np.shape[0]}"
+                    )
 
-                # Wait for FWD_RES in bucket
-                z_mid_np = self._wait_for_response(bucket_id, session_id, "FWD_RES")
                 z_mid = tf.convert_to_tensor(z_mid_np, dtype=tf.float32)
 
-                # M3 forward/backward
                 with tf.GradientTape() as tape_M3:
                     tape_M3.watch(z_mid)
                     logits = self.M3(z_mid, training=True)
@@ -325,24 +278,17 @@ class BucketPeerM1M3:
                 dL_dz_mid = grads_all[-1]
                 self.opt_M3.apply_gradients(zip(grads_M3, self.M3.trainable_variables))
 
-                # Update bucket with BWD_REQ
                 self._bwd_count += 1
                 dL_dz_mid_np = dL_dz_mid.numpy()
-                payload = encode_message(
-                    "BWD_REQ",
-                    session_id,
-                    sender_pseudo=None,
-                    tensor=dL_dz_mid_np,
-                    key_str=self.shared_key,
-                    target_m2=self.target_m2,
-                    pad_multiple=self.pad_multiple,
-                )
-                self.board.update_bucket(bucket_id, payload)
-                self.bytes_sent += len(payload)
-
-                # Wait for BWD_RES then ack bucket
-                dL_dz_cut_np = self._wait_for_response(bucket_id, session_id, "BWD_RES")
-                self.board.ack_bucket(bucket_id)
+                self.bytes_sent += dL_dz_mid_np.nbytes
+                dL_dz_cut_np = ray.get(self.m2_actor.backward.remote(session_id, dL_dz_mid_np))
+                if dL_dz_cut_np is None:
+                    raise RuntimeError(f"M2 did not have cached forward for session {session_id}")
+                self.bytes_received += dL_dz_cut_np.nbytes
+                if self.verbose and (self._bwd_count % self.log_every == 0):
+                    self.logger.info(
+                        f"[BWD_REQ #{self._bwd_count}] session={session_id} to={self.m2_name}"
+                    )
 
                 dL_dz_cut = tf.convert_to_tensor(dL_dz_cut_np, dtype=tf.float32)
                 grads_M1 = tape_M1.gradient(z_cut, self.M1.trainable_variables, output_gradients=dL_dz_cut)
@@ -353,19 +299,21 @@ class BucketPeerM1M3:
                 loss_val = float(loss_value.numpy())
                 epoch_losses.append(loss_val)
                 epoch_accs.append(acc_batch)
+
                 with open(self.metrics_path, "a") as f:
                     f.write(f"{epoch},{step},{loss_val},{acc_batch}\n")
 
                 if step % 100 == 0:
                     self.logger.info(
-                        f"Epoch {epoch} Step {step}/{steps_per_epoch} "
-                        f"Loss={loss_val:.4f} Acc={acc_batch:.4f}"
+                        f"Epoch {epoch} Step {step}/{steps_per_epoch} Loss={loss_val:.4f} Acc={acc_batch:.4f}"
                     )
 
             mean_loss = float(np.mean(epoch_losses))
             mean_acc = float(np.mean(epoch_accs))
             elapsed = time.time() - start
-            self.logger.info(f"Epoch {epoch} done in {elapsed:.1f}s → Loss={mean_loss:.4f} Acc={mean_acc:.4f}")
+            self.logger.info(
+                f"Epoch {epoch} done in {elapsed:.1f}s → Loss={mean_loss:.4f} Acc={mean_acc:.4f}"
+            )
             self.logger.info(
                 f"[bytes-epoch] epoch={epoch} sent={self.bytes_sent - sent_start}B recv={self.bytes_received - recv_start}B "
                 f"fwd={self._fwd_count - fwd_start} bwd={self._bwd_count - bwd_start} infer={self._infer_count - infer_start}"
@@ -377,23 +325,7 @@ class BucketPeerM1M3:
         )
         return f"{self.actor_name} training finished."
 
-    def _wait_for_response(self, bucket_id: str, session_id: str, expect_op: str):
-        while True:
-            buckets = self.board.poll_buckets()
-            if not buckets:
-                time.sleep(0.01)
-                continue
-            for b in buckets:
-                if b["bucket_id"] != bucket_id:
-                    continue
-                self.bytes_received += len(b["payload"])
-                try:
-                    op, sess, sender, tensor, header = decode_message(b["payload"], self.shared_key)
-                except Exception:
-                    continue
-                if op == expect_op and sess == session_id:
-                    return tensor
-            time.sleep(0.01)
+    # ---------------- evaluation ----------------
 
     def evaluate(self) -> float:
         batch_size = self.batch_size
@@ -404,23 +336,16 @@ class BucketPeerM1M3:
             xb = tf.convert_to_tensor(self.x_test[i:i + batch_size], dtype=tf.float32)
             z_cut = self.M1(xb, training=False)
             z_cut_np = z_cut.numpy()
-
+            self.bytes_sent += z_cut_np.nbytes
             session_id = f"{self.actor_name}-eval-{i}-{uuid.uuid4().hex}"
 
-            payload = encode_message(
-                "INFER_REQ",
-                session_id,
-                sender_pseudo=None,
-                tensor=z_cut_np,
-                key_str=self.shared_key,
-                target_m2=self.target_m2,
-                pad_multiple=self.pad_multiple,
-            )
-            bucket_id = self.board.create_bucket(payload)
-            self.bytes_sent += len(payload)
-
-            z_mid_np = self._wait_for_response(bucket_id, session_id, "INFER_RES")
-            self.board.ack_bucket(bucket_id)
+            self._infer_count += 1
+            z_mid_np = ray.get(self.m2_actor.infer.remote(session_id, z_cut_np))
+            self.bytes_received += z_mid_np.nbytes
+            if self.verbose and (self._infer_count % self.log_every == 0):
+                self.logger.info(
+                    f"[INFER_REQ #{self._infer_count}] session={session_id} to={self.m2_name} batch={z_cut_np.shape[0]}"
+                )
 
             z_mid = tf.convert_to_tensor(z_mid_np, dtype=tf.float32)
             logits = self.M3(z_mid, training=False)
@@ -467,22 +392,17 @@ def main(config_path: str = "config.yaml"):
     m1_model = model_arch
     m2_model = model_arch
     m3_model = model_arch
-    if "pad_multiple" not in general:
-        raise ValueError("general.pad_multiple must be defined in config.yaml")
-    pad_multiple = int(general["pad_multiple"])
-
-    board_host = general.get("board_host", "localhost")
-    board_port = int(general.get("board_port", 50051))  # unified board default
 
     global_logger = setup_global_logger(run_dir, log_level)
     global_logger.info(f"Run dir: {run_dir}")
     global_logger.info(
         f"Config: epochs={epochs}, batch_size={batch_size}, lr={lr}, "
-        f"m2_verbose={m2_verbose}, m1m3_verbose={m1m3_verbose}, bucket_board_addr={board_host}:{board_port} "
-        f"model_architecture={model_arch}"
+        f"m2_verbose={m2_verbose}, m1m3_verbose={m1m3_verbose}, "
+        f"architecture=vanilla-split, model_architecture={model_arch}"
     )
     try:
         import shutil
+
         shutil.copyfile(config_path, os.path.join(run_dir, "config_used.yaml"))
     except Exception as e:
         global_logger.warning(f"Could not save config snapshot: {e}")
@@ -501,42 +421,26 @@ def main(config_path: str = "config.yaml"):
     n_clients = len(m1m3_peers_cfg)
     global_logger.info(f"Configured {n_clients} M1M3 peers and {len(m2_peers_cfg)} M2 peers.")
 
-    m2_keys: Dict[str, str] = {}
-    for m2_cfg in m2_peers_cfg:
-        name = m2_cfg["name"]
-        key = m2_cfg.get("key", "") or ""
-        m2_keys[name] = key
-
-    global_logger.info(f"Using bucket board at {board_host}:{board_port}")
-
     x_shards = np.array_split(x_train, n_clients)
     y_shards = np.array_split(y_train, n_clients)
 
     m2_peers: Dict[str, Any] = {}
     for m2_cfg in m2_peers_cfg:
         name = m2_cfg["name"]
-        key = m2_keys.get(name, "")
-        m2_peer = BucketPeerM2.remote(
+        m2_peer = VanillaPeerM2.remote(
             name=name,
             run_dir=run_dir,
-            board_host=board_host,
-            board_port=board_port,
             m1_model=m1_model,
             m2_model=m2_model,
             m3_model=m3_model,
             input_dim=128,
             lr=lr,
-            shared_key=key,
             log_level=log_level,
             verbose=m2_verbose,
             log_every=m2_log_every,
         )
         m2_peers[name] = m2_peer
-        global_logger.info(f"Spawned Bucket M2 peer: {name} (key_len={len(key)})")
-
-    for name, m2_peer in m2_peers.items():
-        m2_peer.run.remote()
-        global_logger.info(f"Started run() loop for Bucket M2 peer: {name}")
+        global_logger.info(f"Spawned Vanilla M2 peer: {name}")
 
     clients = []
     for i, c_cfg in enumerate(m1m3_peers_cfg):
@@ -544,21 +448,18 @@ def main(config_path: str = "config.yaml"):
         target_m2 = c_cfg["target_m2"]
         if target_m2 not in m2_peers:
             raise ValueError(f"M1M3 peer {name} references unknown M2 peer '{target_m2}'")
-        key = m2_keys.get(target_m2, "")
-        client = BucketPeerM1M3.remote(
+        client = VanillaPeerM1M3.remote(
             name=name,
             run_dir=run_dir,
             x_train=x_shards[i],
             y_train=y_shards[i],
             x_test=x_test,
             y_test=y_test,
-            board_host=board_host,
-            board_port=board_port,
+            m2_actor=m2_peers[target_m2],
+            m2_name=target_m2,
             m1_model=m1_model,
             m2_model=m2_model,
             m3_model=m3_model,
-            target_m2=target_m2,
-            shared_key=key,
             epochs=epochs,
             batch_size=batch_size,
             lr=lr,
@@ -567,12 +468,12 @@ def main(config_path: str = "config.yaml"):
             log_every=m1m3_log_every,
         )
         clients.append(client)
-        global_logger.info(f"Spawned Bucket M1M3 peer: {name} → M2: {target_m2} (key_len={len(key)})")
+        global_logger.info(f"Spawned Vanilla M1M3 peer: {name} → M2: {target_m2}")
 
-    global_logger.info("Starting training for all bucket-mode clients...")
+    global_logger.info("Starting training for all vanilla split-learning clients...")
     ray.get([c.train.remote() for c in clients])
 
-    global_logger.info("Evaluating clients on test set (bucket mode)...")
+    global_logger.info("Evaluating clients on test set (vanilla split)...")
     accs = ray.get([c.evaluate.remote() for c in clients])
     for c_cfg, acc in zip(m1m3_peers_cfg, accs):
         global_logger.info(f"Client {c_cfg['name']} final test accuracy: {acc:.4f}")
