@@ -63,6 +63,11 @@ def load_base_config(path: Path) -> dict:
         return yaml.safe_load(f)
 
 
+def write_config(cfg: dict, path: Path):
+    with path.open("w") as f:
+        yaml.safe_dump(cfg, f)
+
+
 def build_peers(num_peers: int) -> Dict[str, List[dict]]:
     m2_peers = [{"name": f"m2_{i + 1}", "key": f"secret_key_{i + 1}"} for i in range(num_peers)]
     m1m3_peers = []
@@ -177,6 +182,11 @@ def run_combo(
             if total_gb > SINGLE_BLIND_MAX_GB:
                 print(f"[skip] {run_name}: estimated {total_gb:.1f}GB exceeds {SINGLE_BLIND_MAX_GB}GB cap")
                 return
+            print(
+                f"[run] {run_name} peers={num_peers} arch={arch} model={model} pad={pad} "
+                f"(Ray mem≈{total_gb:.1f}GB, obj_store≈{obj_gb:.1f}GB)",
+                flush=True,
+            )
             object_store_bytes = int(obj_gb * 1024 ** 3)
             total_bytes = int(total_gb * 1024 ** 3)
             ray_cmd = [
@@ -212,15 +222,20 @@ def run_combo(
                 print(f"[warn] Pairing server not reachable for {run_name}; skipping run")
                 return
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp:
-            yaml.safe_dump(cfg, tmp)
-            cfg_path = tmp.name
+        # Persist config to the real config.yaml so each run uses an actual file update.
+        config_path = REPO_ROOT / "config.yaml"
+        write_config(cfg, config_path)
 
         if dry_run:
-            print(f"[dry-run] Would run {run_name} with config {cfg_path}")
+            print(f"[dry-run] Would run {run_name} with config {config_path}")
             return
 
-        entrypoint = [sys.executable, "client.py", cfg_path]
+        entrypoint = [sys.executable, "client.py", str(config_path)]
+        if arch != "single-blind-two-pools":
+            print(
+                f"[run] {run_name} peers={num_peers} arch={arch} model={model} pad={pad}",
+                flush=True,
+            )
         combo_proc = start_process(entrypoint, log_file=combo_log, env=env)
         if timeout:
             try:
@@ -242,20 +257,28 @@ def run_combo(
 
 def main(args):
     base_cfg = load_base_config(DEFAULT_CONFIG)
+    # Keep a backup of the original config for restoration after the sweep.
+    backup_path = LOG_DIR / "config_backup.yaml"
+    write_config(base_cfg, backup_path)
+
     print("combinations: ", len(PEER_COUNTS) * len(MODELS) * len(PAD_MULTIPLES) * len(ARCHITECTURES))
-    for num_peers in PEER_COUNTS:
-        for model in MODELS:
-            for pad in PAD_MULTIPLES:
-                for arch in ARCHITECTURES:
-                    run_combo(
-                        arch=arch,
-                        model=model,
-                        pad=pad,
-                        num_peers=num_peers,
-                        base_cfg=base_cfg,
-                        dry_run=args.dry_run,
-                        timeout=args.timeout,
-                    )
+    try:
+        for num_peers in PEER_COUNTS:
+            for model in MODELS:
+                for pad in PAD_MULTIPLES:
+                    for arch in ARCHITECTURES:
+                        run_combo(
+                            arch=arch,
+                            model=model,
+                            pad=pad,
+                            num_peers=num_peers,
+                            base_cfg=base_cfg,
+                            dry_run=args.dry_run,
+                            timeout=args.timeout,
+                        )
+    finally:
+        # Restore the original config so the repo isn't left in a mutated state.
+        write_config(base_cfg, DEFAULT_CONFIG)
 
 
 
