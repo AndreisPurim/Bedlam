@@ -10,7 +10,11 @@ general:
   log_level: "INFO"
   board_host: "localhost"
   board_port: 50051
+  pairing_host: "localhost"
+  pairing_port: 50052
   # model architectures: default | mlp | deep | resnet-lite
+  # model_architecture: "mlp"
+  # model_architecture: "default"
   model_architecture: "mlp"
   pad_multiple: 1024
 
@@ -18,7 +22,9 @@ general:
   #   board-blind              -> per-receiver queues
   #   single-blind-two-pools   -> pooled audiences (to_m2, to_clients)
   #   single-blind-bucket      -> bucket-based board
-  architecture: "single-blind-bucket"
+  #   double-blind             -> dynamic pairing via DH + bucket board
+  # architecture: "single-blind-bucket"
+  architecture: "double-blind"
 
   m2_verbose: true
   m2_log_every: 50
@@ -28,6 +34,11 @@ general:
 
   board_verbose: true
   board_log_every: 100
+
+double_blind:
+  # number of peers for the double-blind approach (ignores peers.M1M3/M2)
+  m1m3_count: 3
+  m2_count: 2
 
 peers:
   M2:

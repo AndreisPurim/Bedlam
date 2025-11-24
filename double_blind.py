@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+"""
+double_blind.py — Double-blind privacy architecture.
+
+This mode:
+ - Uses an external pairing server (separate process) to exchange public keys
+   between M1M3 and M2 peers without revealing identities.
+ - Derives a symmetric key via Diffie-Hellman; both peers then encrypt all
+   traffic through the bucket-based board. The board remains blind.
+ - The pairing server only sees availability and request messages containing
+   public keys. Once a match is made, the queued request is dropped.
+ - M2 peers decrypt every bucket they see; if decryption works with their
+   current session key, they process the message. A SESSION_DONE message makes
+   the M2 re-register as available with a fresh keypair.
+
+Board server and pairing server are separate processes. The client workflow is:
+   1) Talk to pairing server to get a partner/public key; derive symmetric key.
+   2) Run training/inference via the board (bucket strategy), encrypting with
+      the derived symmetric key.
+"""
+
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+import base64
+import json
+import logging
+import time
+import uuid
+import hashlib
+from datetime import datetime
+from typing import Dict, Any
+
+import numpy as np
+import ray
+import grpc
+import tensorflow as tf
+from keras import losses, optimizers
+import yaml
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import dh
+
+# gRPC JSON helpers used by PairingClient
+
+
+def _serialize(obj: dict) -> bytes:
+    return json.dumps(obj, separators=(",", ":")).encode("utf-8")
+
+
+def _deserialize(data: bytes) -> dict:
+    if not data:
+        return {}
+    return json.loads(data.decode("utf-8"))
+
+
+from client import (
+    encode_message,
+    decode_message,
+    load_mnist,
+    batch_accuracy,
+    setup_global_logger,
+    setup_peer_logger,
+)
+from bucket_board_client import BucketBoardClient
+from models.factory import build_split_models
+
+
+# ============================================================
+# Pairing client (gRPC JSON)
+# ============================================================
+
+
+class PairingClient:
+    def __init__(self, host: str, port: int, logger: logging.Logger):
+        self.base = f"{host}:{port}"
+        self.logger = logger
+        opts = [
+            ("grpc.max_send_message_length", 16 * 1024 * 1024),
+            ("grpc.max_receive_message_length", 16 * 1024 * 1024),
+        ]
+        self.channel = grpc.insecure_channel(self.base, options=opts)
+
+    def _call(self, method: str, payload: dict):
+        stub = self.channel.unary_unary(
+            f"/pairing.PairingService/{method}",
+            request_serializer=_serialize,
+            response_deserializer=_deserialize,
+        )
+        return stub(payload)
+
+    def get_dh_params(self):
+        data = self._call("DhParams", {})
+        return data["p"], data["g"]
+
+    def request_pair(self, client_id: str, public_key: bytes):
+        data = self._call(
+            "Request",
+            {
+                "client_id": client_id,
+                "public_key": base64.b64encode(public_key).decode("ascii"),
+            },
+        )
+        return self._decode_assignment(data)
+
+    def poll_assignment_client(self, client_id: str):
+        data = self._call("PollAssignment", {"client_id": client_id})
+        return self._decode_assignment(data)
+
+    def register_m2(self, m2_id: str, public_key: bytes):
+        data = self._call(
+            "RegisterM2",
+            {
+                "m2_id": m2_id,
+                "public_key": base64.b64encode(public_key).decode("ascii"),
+            },
+        )
+        return self._decode_assignment(data)
+
+    def poll_assignment_m2(self, m2_id: str):
+        data = self._call("PollAssignmentM2", {"m2_id": m2_id})
+        return self._decode_assignment(data)
+
+    @staticmethod
+    def _decode_assignment(data: dict):
+        if not data.get("assigned"):
+            return None
+        peer_pk_b64 = data.get("peer_public_key", "")
+        if not peer_pk_b64:
+            return None
+        return base64.b64decode(peer_pk_b64)
+
+
+# ============================================================
+# Crypto helpers
+# ============================================================
+
+
+def _serialize_public_key(public_key) -> bytes:
+    return public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
+def _load_public_key(public_key_bytes: bytes):
+    return serialization.load_pem_public_key(public_key_bytes)
+
+
+def _derive_shared_key_hex(private_key, peer_public_bytes: bytes) -> str:
+    peer_public = _load_public_key(peer_public_bytes)
+    shared_secret = private_key.exchange(peer_public)
+    return hashlib.sha256(shared_secret).hexdigest()
+
+
+# ============================================================
+# Double-blind M2 peer
+# ============================================================
+
+
+@ray.remote
+class DoubleBlindPeerM2:
+    def __init__(
+        self,
+        name: str,
+        run_dir: str,
+        board_host: str,
+        board_port: int,
+        pairing_host: str,
+        pairing_port: int,
+        m1_model: str = "default",
+        m2_model: str = "default",
+        m3_model: str = "default",
+        pad_multiple: int = 1024,
+        input_dim: int = 128,
+        lr: float = 1e-3,
+        log_level: str = "INFO",
+        verbose: bool = False,
+        log_every: int = 50,
+    ):
+        self.name = name
+        self.logger = setup_peer_logger(name, run_dir, log_level)
+        self.board = BucketBoardClient(board_host, board_port)
+        self.pairing = PairingClient(pairing_host, pairing_port, logger=self.logger)
+        self.pad_multiple = pad_multiple
+        self.verbose = verbose
+        self.log_every = max(1, int(log_every))
+
+        _, self.M2, _ = build_split_models(
+            m1_name=m1_model,
+            m2_name=m2_model,
+            m3_name=m3_model,
+            m2_kwargs={"input_dim": input_dim},
+        )
+        self.opt_M2 = optimizers.Adam(learning_rate=lr)
+        self._sessions: Dict[str, tuple] = {}
+
+        self._dh_params = None
+        self._private_key = None
+        self._public_key_bytes = None
+        self._shared_key_hex = None
+
+        self.logger.info(
+            f"Initialized DoubleBlindPeerM2 board={board_host}:{board_port} pairing={pairing_host}:{pairing_port} pad={pad_multiple} lr={lr}"
+        )
+
+    # ---------------- key + pairing ----------------
+
+    def _ensure_dh_params(self):
+        if self._dh_params is None:
+            p, g = self.pairing.get_dh_params()
+            numbers = dh.DHParameterNumbers(p, g)
+            self._dh_params = numbers.parameters()
+
+    def _rotate_keypair(self):
+        self._ensure_dh_params()
+        self._private_key = self._dh_params.generate_private_key()
+        self._public_key_bytes = _serialize_public_key(self._private_key.public_key())
+
+    def _wait_for_assignment(self):
+        self._rotate_keypair()
+        self.logger.info("[pairing] registering availability with pairing server")
+        assignment = self.pairing.register_m2(self.name, self._public_key_bytes)
+        while assignment is None:
+            self.logger.info("[pairing] waiting for client request...")
+            time.sleep(0.05)
+            assignment = self.pairing.poll_assignment_m2(self.name)
+        self._shared_key_hex = _derive_shared_key_hex(self._private_key, assignment)
+        self.logger.info("[pairing] paired with a client; ready for session")
+
+    # ---------------- main loop ----------------
+
+    def run(self):
+        self.logger.info("DoubleBlindPeerM2.run loop started.")
+        while True:
+            self._wait_for_assignment()
+            self._session_loop()
+
+    def _session_loop(self):
+        while True:
+            buckets = self.board.poll_buckets()
+            if not buckets:
+                time.sleep(0.01)
+                continue
+
+            for b in buckets:
+                bid = b["bucket_id"]
+                try:
+                    op, session, sender, tensor, header = decode_message(b["payload"], self._shared_key_hex)
+                except Exception:
+                    continue  # not for this session/key
+
+                if self.verbose:
+                    self.logger.info(f"[recv] bucket={bid} op={op} session={session}")
+
+                if header.get("session_done") or op == "SESSION_DONE":
+                    self.board.ack_bucket(bid)
+                    self.logger.info("Session done signal received; re-registering availability")
+                    self._cleanup_session()
+                    return
+
+                if op == "FWD_REQ":
+                    self._handle_forward(bid, session, tensor)
+                elif op == "BWD_REQ":
+                    self._handle_backward(bid, session, tensor)
+                elif op == "INFER_REQ":
+                    self._handle_infer(bid, session, tensor)
+
+    def _cleanup_session(self):
+        self._sessions.clear()
+        self._shared_key_hex = None
+        self._private_key = None
+        self._public_key_bytes = None
+
+    # ---------------- handlers ----------------
+
+    def _handle_forward(self, bucket_id: str, session_id: str, z_cut_np: np.ndarray):
+        z_cut = tf.convert_to_tensor(z_cut_np, dtype=tf.float32)
+        with tf.GradientTape() as tape:
+            tape.watch(z_cut)
+            z_mid = self.M2(z_cut, training=True)
+        self._sessions[session_id] = (tape, z_cut, z_mid)
+        z_mid_np = z_mid.numpy()
+
+        resp = encode_message(
+            "FWD_RES",
+            session_id,
+            sender_pseudo=None,
+            tensor=z_mid_np,
+            key_str=self._shared_key_hex,
+            pad_multiple=self.pad_multiple,
+        )
+        self.board.update_bucket(bucket_id, resp)
+
+    def _handle_backward(self, bucket_id: str, session_id: str, dL_dz_mid_np: np.ndarray):
+        if session_id not in self._sessions:
+            self.logger.error(f"[BWD] no cached forward for session={session_id}")
+            return
+        tape, z_cut, z_mid = self._sessions.pop(session_id)
+        dL_dz_mid = tf.convert_to_tensor(dL_dz_mid_np, dtype=tf.float32)
+        targets = self.M2.trainable_variables + [z_cut]
+        grads_all = tape.gradient(z_mid, targets, output_gradients=dL_dz_mid)
+        grads_M2 = grads_all[:-1]
+        dL_dz_cut = grads_all[-1]
+        self.opt_M2.apply_gradients(zip(grads_M2, self.M2.trainable_variables))
+        dL_dz_cut_np = dL_dz_cut.numpy()
+
+        resp = encode_message(
+            "BWD_RES",
+            session_id,
+            sender_pseudo=None,
+            tensor=dL_dz_cut_np,
+            key_str=self._shared_key_hex,
+            pad_multiple=self.pad_multiple,
+        )
+        self.board.update_bucket(bucket_id, resp)
+
+    def _handle_infer(self, bucket_id: str, session_id: str, z_cut_np: np.ndarray):
+        z_cut = tf.convert_to_tensor(z_cut_np, dtype=tf.float32)
+        z_mid = self.M2(z_cut, training=False)
+        z_mid_np = z_mid.numpy()
+
+        resp = encode_message(
+            "INFER_RES",
+            session_id,
+            sender_pseudo=None,
+            tensor=z_mid_np,
+            key_str=self._shared_key_hex,
+            pad_multiple=self.pad_multiple,
+        )
+        self.board.update_bucket(bucket_id, resp)
+
+
+# ============================================================
+# Double-blind M1M3 peer
+# ============================================================
+
+
+@ray.remote
+class DoubleBlindPeerM1M3:
+    def __init__(
+        self,
+        name: str,
+        run_dir: str,
+        x_train: np.ndarray,
+        y_train: np.ndarray,
+        x_test: np.ndarray,
+        y_test: np.ndarray,
+        board_host: str,
+        board_port: int,
+        pairing_host: str,
+        pairing_port: int,
+        m1_model: str = "default",
+        m2_model: str = "default",
+        m3_model: str = "default",
+        pad_multiple: int = 1024,
+        epochs: int = 3,
+        batch_size: int = 128,
+        lr: float = 1e-3,
+        log_level: str = "INFO",
+        verbose: bool = False,
+        log_every: int = 50,
+    ):
+        self.actor_name = name
+        self.logger = setup_peer_logger(name, run_dir, log_level)
+
+        self.x_train = x_train
+        self.y_train = y_train
+        self.x_test = x_test
+        self.y_test = y_test
+        self.board = BucketBoardClient(board_host, board_port)
+        self.pairing = PairingClient(pairing_host, pairing_port, logger=self.logger)
+        self.pad_multiple = pad_multiple
+
+        self.epochs = epochs
+        self.batch_size = batch_size
+
+        self.M1, _, self.M3 = build_split_models(
+            m1_name=m1_model,
+            m2_name=m2_model,
+            m3_name=m3_model,
+            m3_kwargs={"input_dim": 64},
+        )
+        self.opt_M1 = optimizers.Adam(learning_rate=lr)
+        self.opt_M3 = optimizers.Adam(learning_rate=lr)
+        self.loss_fn = losses.SparseCategoricalCrossentropy()
+
+        self.verbose = verbose
+        self.log_every = max(1, int(log_every))
+        self._fwd_count = 0
+        self._bwd_count = 0
+        self._infer_count = 0
+        self._seen_buckets: set[str] = set()
+
+        self._dh_params = None
+        self._private_key = None
+        self._shared_key_hex = None
+
+        self.metrics_path = os.path.join(run_dir, f"metrics_{self.actor_name}.csv")
+        with open(self.metrics_path, "w") as f:
+            f.write("epoch,step,loss,acc\n")
+
+        self.logger.info(
+            f"Initialized DoubleBlindPeerM1M3 actor_name={self.actor_name} epochs={epochs} batch_size={batch_size}"
+        )
+
+    # ---------------- pairing helpers ----------------
+
+    def _ensure_dh_params(self):
+        if self._dh_params is None:
+            p, g = self.pairing.get_dh_params()
+            numbers = dh.DHParameterNumbers(p, g)
+            self._dh_params = numbers.parameters()
+
+    def _request_pair(self):
+        self._ensure_dh_params()
+        self._private_key = self._dh_params.generate_private_key()
+        public_bytes = _serialize_public_key(self._private_key.public_key())
+        self.logger.info("[pairing] requesting partner from pairing server")
+        assignment = self.pairing.request_pair(self.actor_name, public_bytes)
+        attempts = 0
+        while assignment is None:
+            self.logger.info("[pairing] waiting for available M2...")
+            time.sleep(0.05)
+            assignment = self.pairing.poll_assignment_client(self.actor_name)
+            attempts += 1
+            if attempts % 40 == 0:  # re-announce every ~2s to refresh queue
+                self.logger.info("[pairing] re-sending pairing request to refresh queue")
+                self.pairing.request_pair(self.actor_name, public_bytes)
+
+        self._shared_key_hex = _derive_shared_key_hex(self._private_key, assignment)
+        self.logger.info("[pairing] partner found; starting session")
+
+    # ---------------- training ----------------
+
+    def train(self):
+        self._request_pair()
+
+        n = len(self.x_train)
+        steps_per_epoch = n // self.batch_size
+        self.logger.info(f"Starting training on {n} samples, {steps_per_epoch} steps/epoch.")
+
+        for epoch in range(1, self.epochs + 1):
+            idx = np.random.permutation(n)
+            x_sh = self.x_train[idx]
+            y_sh = self.y_train[idx]
+
+            epoch_losses, epoch_accs = [], []
+            start = time.time()
+
+            for step in range(steps_per_epoch):
+                lo = step * self.batch_size
+                hi = lo + self.batch_size
+                xb = tf.convert_to_tensor(x_sh[lo:hi], dtype=tf.float32)
+                yb = tf.convert_to_tensor(y_sh[lo:hi], dtype=tf.int32)
+
+                with tf.GradientTape(persistent=True) as tape_M1:
+                    z_cut = self.M1(xb, training=True)
+                z_cut_np = z_cut.numpy()
+
+                session_id = f"{self.actor_name}-train-{epoch}-{step}-{uuid.uuid4().hex}"
+
+                self._fwd_count += 1
+                payload = encode_message(
+                    "FWD_REQ",
+                    session_id,
+                    sender_pseudo=None,
+                    tensor=z_cut_np,
+                    key_str=self._shared_key_hex,
+                    pad_multiple=self.pad_multiple,
+                )
+                bucket_id = self.board.create_bucket(payload)
+
+                z_mid_np = self._wait_for_response(bucket_id, session_id, "FWD_RES")
+                z_mid = tf.convert_to_tensor(z_mid_np, dtype=tf.float32)
+
+                with tf.GradientTape() as tape_M3:
+                    tape_M3.watch(z_mid)
+                    logits = self.M3(z_mid, training=True)
+                    loss_value = self.loss_fn(yb, logits)
+
+                targets = self.M3.trainable_variables + [z_mid]
+                grads_all = tape_M3.gradient(loss_value, targets)
+                grads_M3 = grads_all[:-1]
+                dL_dz_mid = grads_all[-1]
+                self.opt_M3.apply_gradients(zip(grads_M3, self.M3.trainable_variables))
+
+                self._bwd_count += 1
+                dL_dz_mid_np = dL_dz_mid.numpy()
+                payload = encode_message(
+                    "BWD_REQ",
+                    session_id,
+                    sender_pseudo=None,
+                    tensor=dL_dz_mid_np,
+                    key_str=self._shared_key_hex,
+                    pad_multiple=self.pad_multiple,
+                )
+                self.board.update_bucket(bucket_id, payload)
+
+                dL_dz_cut_np = self._wait_for_response(bucket_id, session_id, "BWD_RES")
+                self.board.ack_bucket(bucket_id)
+
+                dL_dz_cut = tf.convert_to_tensor(dL_dz_cut_np, dtype=tf.float32)
+                grads_M1 = tape_M1.gradient(z_cut, self.M1.trainable_variables, output_gradients=dL_dz_cut)
+                self.opt_M1.apply_gradients(zip(grads_M1, self.M1.trainable_variables))
+                del tape_M1
+
+                acc_batch = batch_accuracy(yb.numpy(), logits.numpy())
+                loss_val = float(loss_value.numpy())
+                epoch_losses.append(loss_val)
+                epoch_accs.append(acc_batch)
+                with open(self.metrics_path, "a") as f:
+                    f.write(f"{epoch},{step},{loss_val},{acc_batch}\n")
+
+                if step % 100 == 0:
+                    self.logger.info(
+                        f"Epoch {epoch} Step {step}/{steps_per_epoch} Loss={loss_val:.4f} Acc={acc_batch:.4f}"
+                    )
+
+            mean_loss = float(np.mean(epoch_losses))
+            mean_acc = float(np.mean(epoch_accs))
+            elapsed = time.time() - start
+            self.logger.info(f"Epoch {epoch} done in {elapsed:.1f}s → Loss={mean_loss:.4f} Acc={mean_acc:.4f}")
+
+        # Release M2 for reuse before evaluation so queued peers can pair
+        self._send_session_done()
+        return f"{self.actor_name} training finished."
+
+    def _wait_for_response(self, bucket_id: str, session_id: str, expect_op: str, timeout_sec: float | None = None):
+        start_wait = time.time()
+        last_log = start_wait
+        while True:
+            buckets = self.board.poll_buckets()
+            if not buckets:
+                time.sleep(0.01)
+                continue
+            for b in buckets:
+                if b["bucket_id"] != bucket_id:
+                    continue
+                try:
+                    op, sess, sender, tensor, header = decode_message(b["payload"], self._shared_key_hex)
+                except Exception:
+                    continue
+                if op == expect_op and sess == session_id:
+                    return tensor
+            time.sleep(0.01)
+            now = time.time()
+            if now - last_log > 5:
+                self.logger.info(
+                    f"[wait] still waiting for {expect_op} session={session_id} bucket={bucket_id} elapsed={now - start_wait:.1f}s"
+                )
+                last_log = now
+            if timeout_sec and (now - start_wait) > timeout_sec:
+                raise TimeoutError(f"Timeout waiting for {expect_op} for session {session_id}")
+
+    # ---------------- evaluation ----------------
+
+    def evaluate(self) -> float:
+        if not self._shared_key_hex:
+            # Re-pair for evaluation if training already released the session
+            self._request_pair()
+
+        batch_size = self.batch_size
+        n = len(self.x_test)
+        all_logits = []
+
+        for i in range(0, n, batch_size):
+            xb = tf.convert_to_tensor(self.x_test[i:i + batch_size], dtype=tf.float32)
+            z_cut = self.M1(xb, training=False)
+            z_cut_np = z_cut.numpy()
+
+            session_id = f"{self.actor_name}-eval-{i}-{uuid.uuid4().hex}"
+
+            retries = 0
+            while True:
+                try:
+                    if not self._shared_key_hex:
+                        self._request_pair()
+
+                    payload = encode_message(
+                        "INFER_REQ",
+                        session_id,
+                        sender_pseudo=None,
+                        tensor=z_cut_np,
+                        key_str=self._shared_key_hex,
+                        pad_multiple=self.pad_multiple,
+                    )
+                    bucket_id = self.board.create_bucket(payload)
+                    self.logger.info(
+                        f"[eval] sent INFER_REQ session={session_id} bucket={bucket_id} batch={z_cut_np.shape[0]}"
+                    )
+
+                    z_mid_np = self._wait_for_response(bucket_id, session_id, "INFER_RES", timeout_sec=120)
+                    self.board.ack_bucket(bucket_id)
+                    break
+                except TimeoutError as e:
+                    retries += 1
+                    self.logger.error(
+                        f"[eval] timeout waiting for INFER_RES session={session_id} attempt={retries}; re-pairing and retrying"
+                    )
+                    self._send_session_done()
+                    if retries >= 3:
+                        raise e
+                    # clear key so _request_pair happens on next loop
+                    self._shared_key_hex = None
+                    time.sleep(0.5)
+
+            z_mid = tf.convert_to_tensor(z_mid_np, dtype=tf.float32)
+            logits = self.M3(z_mid, training=False)
+            all_logits.append(logits.numpy())
+
+        logits_full = np.concatenate(all_logits, axis=0)[:n]
+        acc = batch_accuracy(self.y_test, logits_full)
+        self.logger.info(f"Test accuracy: {acc:.4f}")
+        self._send_session_done()
+        return float(acc)
+
+    def _send_session_done(self):
+        if not self._shared_key_hex:
+            return
+        session_id = f"{self.actor_name}-session-done-{uuid.uuid4().hex}"
+        payload = encode_message(
+            "SESSION_DONE",
+            session_id,
+            sender_pseudo=None,
+            tensor=np.array([], dtype=np.float32),
+            key_str=self._shared_key_hex,
+            session_done=True,
+            pad_multiple=self.pad_multiple,
+        )
+        self.board.create_bucket(payload)
+        self._shared_key_hex = None
+
+
+# ============================================================
+# Main entrypoint
+# ============================================================
+
+
+def main(config_path: str = "config.yaml"):
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    run_cfg = cfg.get("run", {})
+    general = cfg.get("general", {})
+    db_cfg = cfg.get("double_blind", {})
+
+    base_dir = run_cfg.get("base_dir", "runs")
+    run_name = run_cfg.get("name") or datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    run_dir = os.path.join(base_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+
+    epochs = int(general.get("epochs", 2))
+    batch_size = int(general.get("batch_size", 128))
+    lr = float(general.get("lr", 1e-3))
+    suppress_warnings = bool(general.get("suppress_warnings", False))
+    log_level = general.get("log_level", "INFO")
+    model_arch = general.get("model_architecture", "default")
+    m1_model = model_arch
+    m2_model = model_arch
+    m3_model = model_arch
+    if "pad_multiple" not in general:
+        raise ValueError("general.pad_multiple must be defined in config.yaml")
+    pad_multiple = int(general["pad_multiple"])
+
+    board_host = general.get("board_host", "localhost")
+    board_port = int(general.get("board_port", 50051))
+    pairing_host = general.get("pairing_host", "localhost")
+    pairing_port = int(general.get("pairing_port", 50052))
+
+    m1m3_count = int(db_cfg.get("m1m3_count", 0))
+    m2_count = int(db_cfg.get("m2_count", 0))
+    if m1m3_count <= 0 or m2_count <= 0:
+        raise ValueError("double_blind.m1m3_count and double_blind.m2_count must be > 0")
+
+    global_logger = setup_global_logger(run_dir, log_level)
+    global_logger.info(f"Run dir: {run_dir}")
+    global_logger.info(
+        f"Double-blind config: m1m3_count={m1m3_count}, m2_count={m2_count}, epochs={epochs}, batch_size={batch_size}, lr={lr}, model={model_arch}"
+    )
+    try:
+        import shutil
+        shutil.copyfile(config_path, os.path.join(run_dir, "config_used.yaml"))
+    except Exception as e:
+        global_logger.warning(f"Could not save config snapshot: {e}")
+
+    os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
+    ray_logging_level = logging.ERROR if suppress_warnings else logging.INFO
+    ray_log_to_driver = not suppress_warnings
+    ray.init(ignore_reinit_error=True, logging_level=ray_logging_level, log_to_driver=ray_log_to_driver)
+
+    (x_train, y_train), (x_test, y_test) = load_mnist()
+    x_shards = np.array_split(x_train, m1m3_count)
+    y_shards = np.array_split(y_train, m1m3_count)
+
+    m2_peers = []
+    for i in range(m2_count):
+        name = f"db_m2_{i + 1}"
+        actor = DoubleBlindPeerM2.remote(
+            name=name,
+            run_dir=run_dir,
+            board_host=board_host,
+            board_port=board_port,
+            pairing_host=pairing_host,
+            pairing_port=pairing_port,
+            m1_model=m1_model,
+            m2_model=m2_model,
+            m3_model=m3_model,
+            pad_multiple=pad_multiple,
+            input_dim=128,
+            lr=lr,
+            log_level=log_level,
+            verbose=bool(general.get("m2_verbose", False)),
+            log_every=int(general.get("m2_log_every", 50)),
+        )
+        m2_peers.append(actor)
+        global_logger.info(f"Spawned double-blind M2 peer: {name}")
+
+    for actor in m2_peers:
+        actor.run.remote()
+
+    clients = []
+    for i in range(m1m3_count):
+        name = f"db_client_{i + 1}"
+        client = DoubleBlindPeerM1M3.remote(
+            name=name,
+            run_dir=run_dir,
+            x_train=x_shards[i],
+            y_train=y_shards[i],
+            x_test=x_test,
+            y_test=y_test,
+            board_host=board_host,
+            board_port=board_port,
+            pairing_host=pairing_host,
+            pairing_port=pairing_port,
+            m1_model=m1_model,
+            m2_model=m2_model,
+            m3_model=m3_model,
+            pad_multiple=pad_multiple,
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=lr,
+            log_level=log_level,
+            verbose=bool(general.get("m1m3_verbose", False)),
+            log_every=int(general.get("m1m3_log_every", 50)),
+        )
+        clients.append(client)
+        global_logger.info(f"Spawned double-blind M1M3 peer: {name}")
+
+    global_logger.info("Starting double-blind training for all clients...")
+    ray.get([c.train.remote() for c in clients])
+
+    global_logger.info("Evaluating clients on test set (double-blind mode)...")
+    accs = ray.get([c.evaluate.remote() for c in clients])
+    for i, acc in enumerate(accs):
+        global_logger.info(f"Client db_client_{i + 1} final test accuracy: {acc:.4f}")
+
+
+if __name__ == "__main__":
+    main()

@@ -183,6 +183,8 @@ def encode_message(
     tensor: np.ndarray,
     key_str: str,
     target_m2: str | None = None,
+    pair_id: str | None = None,
+    session_done: bool = False,
     pad_multiple: int | None = None,
 ) -> bytes:
     """
@@ -214,6 +216,10 @@ def encode_message(
         header["sender"] = sender_pseudo
     if target_m2:
         header["target_m2"] = target_m2
+    if pair_id:
+        header["pair_id"] = pair_id
+    if session_done:
+        header["session_done"] = True
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
     header_len = len(header_bytes)
 
@@ -1052,6 +1058,9 @@ def main(config_path: str = "config.yaml"):
     if architecture == "single-blind-bucket":
         from bucket_client import main as bucket_main
         return bucket_main(config_path)
+    if architecture == "double-blind":
+        from double_blind import main as double_blind_main
+        return double_blind_main(config_path)
 
     # ---- Global logger ----
     global_logger = setup_global_logger(run_dir, log_level)
