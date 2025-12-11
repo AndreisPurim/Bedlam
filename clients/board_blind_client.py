@@ -286,6 +286,8 @@ def main(config_path: str = "config.yaml"):
     )
 
     (x_train, y_train), (x_test, y_test) = load_mnist()
+    if "random_seed" not in general:
+        raise ValueError("general.random_seed must be defined in config.yaml")
     seed = int(general.get("random_seed", 42))
 
     m1m3_peers_cfg = peers_cfg.get("M1M3", [])

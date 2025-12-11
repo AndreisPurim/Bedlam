@@ -867,6 +867,8 @@ def main(config_path: str = "config.yaml"):
     ray.init(ignore_reinit_error=True, logging_level=ray_logging_level, log_to_driver=ray_log_to_driver)
 
     (x_train, y_train), (x_test, y_test) = load_mnist()
+    if "random_seed" not in general:
+        raise ValueError("general.random_seed must be defined in config.yaml")
     seed = int(general.get("random_seed", 42))
     x_shards, y_shards = stratified_split(x_train, y_train, m1m3_count, seed=seed)
 
