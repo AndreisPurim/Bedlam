@@ -44,7 +44,7 @@ MODELS = ["default"]
 PAD_MULTIPLES = [1024]
 ARCHITECTURES = ["vanilla-split", "board-blind", "single-blind-bucket", "double-blind"]
 BOARD_HOST = "127.0.0.1"
-BOARD_PORTS = [50051, 50061, 50071]
+BOARD_PORT = 50051
 PAIRING_HOST = "127.0.0.1"
 PAIRING_PORTS = [50052, 50062, 50072]
 
@@ -135,7 +135,6 @@ def prepare_config(
     pad: int,
     num_m1m3: int,
     num_m2: int,
-    board_port: int,
     pairing_port: int,
 ) -> dict:
     cfg = deepcopy(base_cfg)
@@ -146,7 +145,7 @@ def prepare_config(
     cfg["general"]["model_architecture"] = model
     cfg["general"]["pad_multiple"] = pad
     cfg["general"]["board_host"] = BOARD_HOST
-    cfg["general"]["board_port"] = board_port
+    cfg["general"]["board_port"] = BOARD_PORT
     cfg["general"]["pairing_host"] = PAIRING_HOST
     cfg["general"]["pairing_port"] = pairing_port
 
@@ -166,12 +165,11 @@ def run_combo(
     base_cfg: dict,
     dry_run: bool,
     timeout: int,
-    board_port: int,
     pairing_port: int,
 ):
     suffix = f"p{num_m1m3}m2_{num_m2}" if num_m2 != num_m1m3 else f"p{num_m1m3}"
     run_name = f"auto_{arch}_{suffix}_{model}_pad{pad}_{int(time.time())}"
-    cfg = prepare_config(base_cfg, run_name, arch, model, pad, num_m1m3, num_m2, board_port, pairing_port)
+    cfg = prepare_config(base_cfg, run_name, arch, model, pad, num_m1m3, num_m2, pairing_port)
 
     board_proc = pairing_proc = ray_proc = None
     pairing_already = False
@@ -184,10 +182,10 @@ def run_combo(
 
         # Start board for all modes (vanilla uses plaintext over the same gRPC service)
         board_proc = start_process(
-            [sys.executable, "board_server.py", "--host", BOARD_HOST, "--port", str(board_port)],
+            [sys.executable, "board_server.py", "--host", BOARD_HOST, "--port", str(BOARD_PORT)],
             log_file=LOG_DIR / f"{run_name}_board.log",
         )
-        if not wait_for_port(BOARD_HOST, board_port, timeout=10):
+        if not wait_for_port(BOARD_HOST, BOARD_PORT, timeout=10):
             print(f"[warn] Board server not reachable for {run_name}; skipping")
             return
 
@@ -239,7 +237,6 @@ def main(args):
     write_config(base_cfg, backup_path)
 
     pairing_index = 0
-    board_index = 0
 
     try:
         for num_m1m3 in PEER_COUNTS:
@@ -250,8 +247,6 @@ def main(args):
                         for m1m3_count, m2_count in combos:
                             pairing_port = PAIRING_PORTS[pairing_index % len(PAIRING_PORTS)]
                             pairing_index += 1
-                            board_port = BOARD_PORTS[board_index % len(BOARD_PORTS)]
-                            board_index += 1
                             run_combo(
                                 arch=arch,
                                 model=model,
@@ -261,7 +256,6 @@ def main(args):
                                 base_cfg=base_cfg,
                                 dry_run=args.dry_run,
                                 timeout=args.timeout,
-                                board_port=board_port,
                                 pairing_port=pairing_port,
                             )
     finally:
