@@ -63,7 +63,7 @@ from client import (
     setup_peer_logger,
 )
 from models.factory import build_split_models
-from peers.base import BaseBucketBoardClient, BaseBucketM1M3Peer, BaseBucketM2Peer
+from peers.base import BaseBucketBoardClient, BaseBucketM1M3Peer, BaseBucketM2Peer, stratified_split
 
 # ============================================================
 # Pairing client (gRPC JSON)
@@ -867,8 +867,8 @@ def main(config_path: str = "config.yaml"):
     ray.init(ignore_reinit_error=True, logging_level=ray_logging_level, log_to_driver=ray_log_to_driver)
 
     (x_train, y_train), (x_test, y_test) = load_mnist()
-    x_shards = np.array_split(x_train, m1m3_count)
-    y_shards = np.array_split(y_train, m1m3_count)
+    seed = int(general.get("random_seed", 42))
+    x_shards, y_shards = stratified_split(x_train, y_train, m1m3_count, seed=seed)
 
     m2_peers = []
     for i in range(m2_count):

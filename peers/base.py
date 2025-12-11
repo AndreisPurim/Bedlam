@@ -19,6 +19,34 @@ DecodeFn = Callable[[bytes], Tuple[str, str, str, np.ndarray]]
 DecodeWithHeaderFn = Callable[[bytes], Tuple[str, str, str, np.ndarray, dict]]
 
 
+def stratified_split(x: np.ndarray, y: np.ndarray, n_shards: int, seed: int = 42):
+    """
+    Split (x, y) into n_shards with class-balanced distribution.
+    Returns two lists: x_shards, y_shards.
+    """
+    rng = np.random.default_rng(seed)
+    x_shards = [[] for _ in range(n_shards)]
+    y_shards = [[] for _ in range(n_shards)]
+
+    classes = np.unique(y)
+    for cls in classes:
+        cls_idx = np.where(y == cls)[0]
+        perm = rng.permutation(cls_idx)
+        for i, idx in enumerate(perm):
+            shard = i % n_shards
+            x_shards[shard].append(x[idx])
+            y_shards[shard].append(y[idx])
+
+    for i in range(n_shards):
+        if x_shards[i]:
+            x_shards[i] = np.stack(x_shards[i], axis=0)
+            y_shards[i] = np.array(y_shards[i], dtype=y.dtype)
+        else:
+            x_shards[i] = np.empty((0,) + x.shape[1:], dtype=x.dtype)
+            y_shards[i] = np.empty((0,), dtype=y.dtype)
+    return x_shards, y_shards
+
+
 class BaseBoardClient:
     """Thin gRPC wrapper matching the legacy Board API."""
 

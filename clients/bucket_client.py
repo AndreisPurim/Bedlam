@@ -36,7 +36,7 @@ from client import (
 )
 from models.factory import build_split_models
 from clients.bucket_board_client import BucketBoardClient
-from peers.base import BaseBucketBoardClient, BaseBucketM1M3Peer, BaseBucketM2Peer
+from peers.base import BaseBucketBoardClient, BaseBucketM1M3Peer, BaseBucketM2Peer, stratified_split
 
 
 # ============================================================
@@ -282,6 +282,7 @@ def main(config_path: str = "config.yaml"):
     ray.init(ignore_reinit_error=True, logging_level=ray_logging_level, log_to_driver=ray_log_to_driver)
 
     (x_train, y_train), (x_test, y_test) = load_mnist()
+    seed = int(general.get("random_seed", 42))
 
     m1m3_peers_cfg = peers_cfg.get("M1M3", [])
     m2_peers_cfg = peers_cfg.get("M2", [])
@@ -298,8 +299,7 @@ def main(config_path: str = "config.yaml"):
 
     global_logger.info(f"Using bucket board at {board_host}:{board_port}")
 
-    x_shards = np.array_split(x_train, n_clients)
-    y_shards = np.array_split(y_train, n_clients)
+    x_shards, y_shards = stratified_split(x_train, y_train, n_clients, seed=seed)
 
     m2_peers: Dict[str, Any] = {}
     for m2_cfg in m2_peers_cfg:

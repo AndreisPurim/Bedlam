@@ -28,7 +28,7 @@ from client import (
     setup_peer_logger,
 )
 from models.factory import build_split_models
-from peers.base import BaseBoardClient, BaseM1M3Peer, BaseM2Peer
+from peers.base import BaseBoardClient, BaseM1M3Peer, BaseM2Peer, stratified_split
 
 
 @ray.remote
@@ -286,6 +286,7 @@ def main(config_path: str = "config.yaml"):
     )
 
     (x_train, y_train), (x_test, y_test) = load_mnist()
+    seed = int(general.get("random_seed", 42))
 
     m1m3_peers_cfg = peers_cfg.get("M1M3", [])
     m2_peers_cfg = peers_cfg.get("M2", [])
@@ -306,8 +307,7 @@ def main(config_path: str = "config.yaml"):
     global_logger.info(f"Using external Board at {board_host}:{board_port}")
 
     # Shard training data across M1M3 peers
-    x_shards = np.array_split(x_train, n_clients)
-    y_shards = np.array_split(y_train, n_clients)
+    x_shards, y_shards = stratified_split(x_train, y_train, n_clients, seed=seed)
 
     # Create M2 peers
     m2_peers: Dict[str, Any] = {}

@@ -23,7 +23,7 @@ from keras import losses, optimizers
 
 from client import load_mnist, batch_accuracy, setup_global_logger, setup_peer_logger
 from models.factory import build_split_models
-from peers.base import BaseBoardClient, BaseM1M3Peer, BaseM2Peer
+from peers.base import BaseBoardClient, BaseM1M3Peer, BaseM2Peer, stratified_split
 
 
 # ============================================================
@@ -284,6 +284,7 @@ def main(config_path: str = "config.yaml"):
     ray.init(ignore_reinit_error=True, logging_level=ray_logging_level, log_to_driver=ray_log_to_driver)
 
     (x_train, y_train), (x_test, y_test) = load_mnist()
+    seed = int(general.get("random_seed", 42))
 
     m1m3_peers_cfg = peers_cfg.get("M1M3", [])
     m2_peers_cfg = peers_cfg.get("M2", [])
@@ -292,8 +293,7 @@ def main(config_path: str = "config.yaml"):
     n_clients = len(m1m3_peers_cfg)
     global_logger.info(f"Configured {n_clients} M1M3 peers and {len(m2_peers_cfg)} M2 peers.")
 
-    x_shards = np.array_split(x_train, n_clients)
-    y_shards = np.array_split(y_train, n_clients)
+    x_shards, y_shards = stratified_split(x_train, y_train, n_clients, seed=seed)
 
     m2_peers: Dict[str, Any] = {}
     for m2_cfg in m2_peers_cfg:
