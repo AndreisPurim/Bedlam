@@ -46,7 +46,7 @@ ARCHITECTURES = ["vanilla-split", "board-blind", "single-blind-bucket", "double-
 BOARD_HOST = "127.0.0.1"
 BOARD_PORT = 50051
 PAIRING_HOST = "127.0.0.1"
-PAIRING_PORT = 50052
+PAIRING_PORTS = [50052, 50062, 50072]
 
 
 def load_base_config(path: Path) -> dict:
@@ -236,6 +236,8 @@ def main(args):
     backup_path = LOG_DIR / "config_backup.yaml"
     write_config(base_cfg, backup_path)
 
+    pairing_index = 0
+
     try:
         for num_m1m3 in PEER_COUNTS:
             combos = [(num_m1m3, num_m1m3), (num_m1m3, max(1, num_m1m3 // 2)), (num_m1m3, num_m1m3 * 2)]
@@ -243,6 +245,8 @@ def main(args):
                 for pad in PAD_MULTIPLES:
                     for arch in ARCHITECTURES:
                         for m1m3_count, m2_count in combos:
+                            pairing_port = PAIRING_PORTS[pairing_index % len(PAIRING_PORTS)]
+                            pairing_index += 1
                             run_combo(
                                 arch=arch,
                                 model=model,
@@ -252,7 +256,7 @@ def main(args):
                                 base_cfg=base_cfg,
                                 dry_run=args.dry_run,
                                 timeout=args.timeout,
-                                pairing_port=PAIRING_PORT,
+                                pairing_port=pairing_port,
                             )
     finally:
         write_config(base_cfg, DEFAULT_CONFIG)
