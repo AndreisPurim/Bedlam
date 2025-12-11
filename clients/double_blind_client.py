@@ -246,6 +246,11 @@ class DoubleBlindPeerM2(BaseBucketM2Peer):
         self._public_key_bytes = _serialize_public_key(self._private_key.public_key())
 
     def _wait_for_assignment(self):
+        # Drop any stale assignment from a previous session before re-registering.
+        try:
+            self.pairing.poll_assignment_m2(self.name)
+        except Exception:
+            pass
         self._rotate_keypair()
         self.logger.info("[pairing] registering availability with pairing server")
         assignment = self.pairing.register_m2(self.name, self._public_key_bytes)
@@ -308,6 +313,10 @@ class DoubleBlindPeerM2(BaseBucketM2Peer):
         self._shared_key_hex = None
         self._private_key = None
         self._public_key_bytes = None
+        try:
+            self.pairing.poll_assignment_m2(self.name)
+        except Exception:
+            pass
 
     # ---------------- handlers ----------------
 
@@ -488,6 +497,11 @@ class DoubleBlindPeerM1M3(BaseBucketM1M3Peer):
     def _reset_pair_state(self):
         self._private_key = None
         self._shared_key_hex = None
+        try:
+            # Clear any stale assignment that might still be queued for this client.
+            self.pairing.poll_assignment_client(self.name)
+        except Exception:
+            pass
 
     def _request_pair(self, max_wait_sec: float = 120.0):
         """
@@ -499,6 +513,11 @@ class DoubleBlindPeerM1M3(BaseBucketM1M3Peer):
         attempt = 0
         while True:
             attempt += 1
+            try:
+                # Drop any leftover assignment from previous attempts before re-requesting.
+                self.pairing.poll_assignment_client(self.name)
+            except Exception:
+                pass
             self._private_key = self._dh_params.generate_private_key()
             public_bytes = _serialize_public_key(self._private_key.public_key())
             self.logger.info("[pairing] requesting partner from pairing server (attempt=%d)", attempt)
@@ -783,6 +802,10 @@ class DoubleBlindPeerM1M3(BaseBucketM1M3Peer):
         self.board.create_bucket(payload)
         # Clear keys so the next request uses a fresh DH exchange.
         self._reset_pair_state()
+        try:
+            self.pairing.poll_assignment_client(self.name)
+        except Exception:
+            pass
         self.bytes_sent += len(payload)
 
 
