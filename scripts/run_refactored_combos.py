@@ -39,7 +39,7 @@ LOG_DIR = REPO_ROOT / "runs" / "automation_logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Tunables
-PEER_COUNTS = [3, 4, 5, 6, 7]
+PEER_COUNTS = [7]
 MODELS = ["default"]
 PAD_MULTIPLES = [1024]
 ARCHITECTURES = ["vanilla-split", "board-blind", "single-blind-bucket", "double-blind"]
@@ -172,6 +172,7 @@ def run_combo(
     cfg = prepare_config(base_cfg, run_name, arch, model, pad, num_m1m3, num_m2, pairing_port)
 
     board_proc = pairing_proc = ray_proc = None
+    pairing_already = False
     combo_log = LOG_DIR / f"{run_name}.log"
     ray_stop()
 
@@ -189,7 +190,6 @@ def run_combo(
             return
 
         # Pairing server for double-blind
-        pairing_already = False
         if arch == "double-blind":
             pairing_proc, pairing_already = ensure_pairing_server(PAIRING_HOST, pairing_port, run_name)
             if pairing_proc is None and pairing_already is False:
