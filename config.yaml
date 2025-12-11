@@ -1,8 +1,8 @@
 double_blind:
-  m1m3_count: 4
-  m2_count: 4
+  m1m3_count: 7
+  m2_count: 14
 general:
-  architecture: board-blind
+  architecture: vanilla-split
   batch_size: 128
   board_host: 127.0.0.1
   board_log_every: 100
@@ -15,10 +15,11 @@ general:
   m1m3_verbose: true
   m2_log_every: 50
   m2_verbose: true
-  model_architecture: deep
+  model_architecture: default
   pad_multiple: 1024
   pairing_host: 127.0.0.1
-  pairing_port: 50052
+  pairing_port: 50072
+  random_seed: 42
   suppress_warnings: true
 peers:
   M1M3:
@@ -30,6 +31,12 @@ peers:
     target_m2: m2_3
   - name: client_4
     target_m2: m2_4
+  - name: client_5
+    target_m2: m2_5
+  - name: client_6
+    target_m2: m2_6
+  - name: client_7
+    target_m2: m2_7
   M2:
   - key: secret_key_1
     name: m2_1
@@ -39,6 +46,27 @@ peers:
     name: m2_3
   - key: secret_key_4
     name: m2_4
+  - key: secret_key_5
+    name: m2_5
+  - key: secret_key_6
+    name: m2_6
+  - key: secret_key_7
+    name: m2_7
+  - key: secret_key_8
+    name: m2_8
+  - key: secret_key_9
+    name: m2_9
+  - key: secret_key_10
+    name: m2_10
+  - key: secret_key_11
+    name: m2_11
+  - key: secret_key_12
+    name: m2_12
+  - key: secret_key_13
+    name: m2_13
+  - key: secret_key_14
+    name: m2_14
+random_seed: 42
 run:
   base_dir: runs
-  name: auto_board-blind_p4_deep_pad1024_1764043202
+  name: auto_vanilla-split_p7m2_14_default_pad1024_1765489957
