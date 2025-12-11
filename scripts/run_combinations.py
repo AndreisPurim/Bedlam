@@ -40,18 +40,22 @@ LOG_DIR = REPO_ROOT / "runs" / "automation_logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # PEER_COUNTS = list(range(1, 11))
-PEER_COUNTS = [2]
+# PEER_COUNTS = [3]
+PEER_COUNTS = [4, 5]
 MODELS = ["default", "mlp", "deep", "resnet-lite"]
+# MODELS = ["mlp", "deep", "resnet-lite"]
+# MODELS = ["default"]
 PAD_MULTIPLES = [1024]
 ARCHITECTURES = [
-    "vanilla-split",
-    "board-blind",
-    "single-blind-bucket",
+    # "vanilla-split",
+    # "board-blind",
+    # "single-blind-bucket",
     "single-blind-two-pools",
     # "double-blind",
 ]
 
-SINGLE_BLIND_MAX_GB = 3.0
+# SINGLE_BLIND_MAX_GB = 3.0
+SINGLE_BLIND_MAX_GB = 8.0
 BOARD_HOST = "127.0.0.1"
 BOARD_PORT = 50051
 PAIRING_HOST = "127.0.0.1"
