@@ -141,6 +141,7 @@ def prepare_config(
     cfg.setdefault("run", {})["name"] = run_name
 
     cfg.setdefault("general", {})
+    seed = cfg["general"].get("random_seed", 42)
     cfg["general"]["architecture"] = arch
     cfg["general"]["model_architecture"] = model
     cfg["general"]["pad_multiple"] = pad
@@ -148,6 +149,7 @@ def prepare_config(
     cfg["general"]["board_port"] = BOARD_PORT
     cfg["general"]["pairing_host"] = PAIRING_HOST
     cfg["general"]["pairing_port"] = pairing_port
+    cfg["general"]["random_seed"] = seed
 
     cfg["peers"] = build_peers(num_m1m3, num_m2)
     cfg.setdefault("double_blind", {})
