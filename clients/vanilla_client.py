@@ -8,7 +8,6 @@ pseudonyms, padding) are intentionally absent here.
 
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import io
 import json
