@@ -39,7 +39,7 @@ LOG_DIR = REPO_ROOT / "runs" / "automation_logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Tunables
-PEER_COUNTS = [7]
+PEER_COUNTS = [i for i in range(10)]
 MODELS = ["default"]
 PAD_MULTIPLES = [1024]
 ARCHITECTURES = ["vanilla-split", "board-blind", "single-blind-bucket", "double-blind"]
