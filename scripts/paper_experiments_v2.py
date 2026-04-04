@@ -1,0 +1,350 @@
+
+
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+from copy import deepcopy
+from pathlib import Path
+from typing import Dict, List
+
+import yaml
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = REPO_ROOT / "config.yaml"
+BOARD_HOST = "127.0.0.1"
+BOARD_PORT = 50051
+PAIRING_HOST = "127.0.0.1"
+
+
+def load_base_config(path: Path) -> dict:
+    with path.open("r") as f:
+        return yaml.safe_load(f)
+
+
+def write_config(cfg: dict, path: Path):
+    with path.open("w") as f:
+        yaml.safe_dump(cfg, f)
+
+
+def build_peers(num_m1m3: int, num_m2: int) -> Dict[str, List[dict]]:
+    m2_peers = [{"name": f"m2_{i + 1}", "key": f"secret_key_{i + 1}"} for i in range(num_m2)]
+    m1m3_peers = [{"name": f"client_{i + 1}", "target_m2": m2_peers[i % num_m2]["name"]} for i in range(num_m1m3)]
+    return {"M2": m2_peers, "M1M3": m1m3_peers}
+
+
+def wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.2)
+    return False
+
+
+def find_free_port(host: str) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return int(s.getsockname()[1])
+
+
+def start_process(cmd: List[str], log_file: Path | None = None, env: dict | None = None) -> subprocess.Popen:
+    stdout = stderr = subprocess.DEVNULL
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        stdout = log_file.open("wb")
+        stderr = subprocess.STDOUT
+    return subprocess.Popen(cmd, stdout=stdout, stderr=stderr, cwd=REPO_ROOT, env=env)
+
+
+def stop_process(proc: subprocess.Popen | None, timeout: float = 5.0):
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def ray_stop():
+    subprocess.run(["ray", "stop", "--force"], cwd=REPO_ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def prepare_config(
+    base_cfg: dict,
+    run_name: str,
+    arch: str,
+    dataset: str,
+    model: str,
+    pad: int,
+    num_m1m3: int,
+    num_m2: int,
+    epochs: int,
+    max_steps: int,
+    parent_run_dir: Path,
+    pairing_port: int,
+) -> dict:
+    cfg = deepcopy(base_cfg)
+    cfg.setdefault("run", {})["name"] = run_name
+    cfg["run"]["base_dir"] = str(parent_run_dir)
+
+    cfg.setdefault("general", {})
+    cfg["general"]["architecture"] = arch
+    cfg["general"]["model_architecture"] = model
+    cfg["general"]["dataset"] = dataset
+    cfg["general"]["epochs"] = epochs
+    cfg["general"]["pad_multiple"] = pad
+    cfg["general"]["board_host"] = BOARD_HOST
+    cfg["general"]["board_port"] = BOARD_PORT
+    cfg["general"]["pairing_host"] = PAIRING_HOST
+    cfg["general"]["pairing_port"] = int(pairing_port)
+    cfg["general"]["enable_perf_metrics"] = True
+    cfg["general"]["use_pir"] = False
+    cfg["general"]["max_steps_per_epoch"] = int(max_steps)
+
+    cfg["peers"] = build_peers(num_m1m3, num_m2)
+    cfg.setdefault("double_blind", {})
+    cfg["double_blind"]["m1m3_count"] = num_m1m3
+    cfg["double_blind"]["m2_count"] = num_m2
+    return cfg
+
+
+def run_one(
+    base_cfg: dict,
+    parent_run_dir: Path,
+    log_dir: Path,
+    arch: str,
+    dataset: str,
+    model: str,
+    pad: int,
+    num_m1m3: int,
+    num_m2: int,
+    epochs: int,
+    max_steps: int,
+    timeout: int,
+    enable_gpu: bool,
+):
+    run_name = f"paper_v2_{arch}_{dataset}_{model}_p{num_m1m3}m2_{num_m2}_{int(time.time())}"
+    run_dir = parent_run_dir / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    pairing_port = find_free_port(PAIRING_HOST) if arch == "double-blind" else 0
+    cfg = prepare_config(
+        base_cfg,
+        run_name,
+        arch,
+        dataset,
+        model,
+        pad,
+        num_m1m3,
+        num_m2,
+        epochs,
+        max_steps,
+        parent_run_dir,
+        pairing_port,
+    )
+
+    board_proc = None
+    pairing_proc = None
+    combo_log = log_dir / f"{run_name}.log"
+    ray_stop()
+
+    try:
+        env = os.environ.copy()
+        env["RAY_DISABLE_USAGE_STATS"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"
+        env["CUDA_VISIBLE_DEVICES"] = "0" if enable_gpu else ""
+
+        board_proc = start_process(
+            [
+                sys.executable,
+                "board_server.py",
+                "--host",
+                BOARD_HOST,
+                "--port",
+                str(BOARD_PORT),
+                "--metrics-path",
+                str(run_dir / "board_metrics.csv"),
+            ],
+            log_file=log_dir / f"{run_name}_board.log",
+            env=env,
+        )
+        if not wait_for_port(BOARD_HOST, BOARD_PORT, timeout=10):
+            print(f"[warn] Board server not reachable for {run_name}; skipping")
+            return
+
+        if arch == "double-blind":
+            pairing_log = log_dir / f"{run_name}_pairing.log"
+            attempts = 3
+            for attempt in range(1, attempts + 1):
+                pairing_port = find_free_port(PAIRING_HOST)
+                cfg["general"]["pairing_port"] = int(pairing_port)
+                pairing_proc = start_process(
+                    [sys.executable, "pairing_server.py", "--host", PAIRING_HOST, "--port", str(pairing_port)],
+                    log_file=pairing_log,
+                    env=env,
+                )
+                if wait_for_port(PAIRING_HOST, pairing_port, timeout=20):
+                    break
+                rc = pairing_proc.poll() if pairing_proc else None
+                if rc is not None:
+                    print(
+                        f"[warn] Pairing server exited with code {rc} for {run_name}; see {pairing_log}",
+                        flush=True,
+                    )
+                stop_process(pairing_proc)
+                pairing_proc = None
+                if attempt < attempts:
+                    print(f"[warn] Pairing server not reachable for {run_name}; retrying", flush=True)
+                    time.sleep(0.5)
+            if pairing_proc is None:
+                print(f"[warn] Pairing server not reachable for {run_name}; skipping")
+                return
+
+        write_config(cfg, DEFAULT_CONFIG)
+        entrypoint = [sys.executable, "client.py", str(DEFAULT_CONFIG)]
+        print(f"[run] {run_name} arch={arch} dataset={dataset} model={model}", flush=True)
+        combo_proc = start_process(entrypoint, log_file=combo_log, env=env)
+        if timeout:
+            try:
+                combo_proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                combo_proc.send_signal(signal.SIGINT)
+                try:
+                    combo_proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    combo_proc.kill()
+        else:
+            combo_proc.wait()
+    finally:
+        stop_process(board_proc)
+        stop_process(pairing_proc)
+        ray_stop()
+
+
+def main(args):
+    base_cfg = load_base_config(DEFAULT_CONFIG)
+
+    parent_name = args.paper_name or f"paper_v2_{int(time.time())}"
+    parent_run_dir = REPO_ROOT / "runs" / parent_name
+    parent_run_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = parent_run_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
+    split_arches = [a.strip() for a in args.arches_split.split(",") if a.strip()]
+
+    # Main runs (accuracy + perf)
+    for dataset in datasets:
+        for arch in split_arches:
+            run_one(
+                base_cfg=base_cfg,
+                parent_run_dir=parent_run_dir,
+                log_dir=log_dir,
+                arch=arch,
+                dataset=dataset,
+                model=args.model,
+                pad=args.pad,
+                num_m1m3=args.clients,
+                num_m2=args.m2,
+                epochs=args.epochs,
+                max_steps=args.max_steps,
+                timeout=args.timeout,
+                enable_gpu=args.enable_gpu,
+            )
+
+    if args.include_fed:
+        run_one(
+            base_cfg=base_cfg,
+            parent_run_dir=parent_run_dir,
+            log_dir=log_dir,
+            arch="federated",
+            dataset=datasets[0],
+            model=args.model,
+            pad=args.pad,
+            num_m1m3=args.clients,
+            num_m2=args.m2,
+            epochs=args.epochs,
+            max_steps=args.max_steps,
+            timeout=args.timeout,
+            enable_gpu=args.enable_gpu,
+        )
+
+    # Scaling runs (MNIST, fixed steps per epoch)
+    scaling_clients = [int(x) for x in args.scaling_clients.split(",") if x.strip()]
+    scaling_m2 = [int(x) for x in args.scaling_m2.split(",") if x.strip()]
+    scaling_dataset = datasets[0]
+    for arch in split_arches:
+        for n_clients in scaling_clients:
+            for m2_count in scaling_m2:
+                run_one(
+                    base_cfg=base_cfg,
+                    parent_run_dir=parent_run_dir,
+                    log_dir=log_dir,
+                    arch=arch,
+                    dataset=scaling_dataset,
+                    model=args.model,
+                    pad=args.pad,
+                    num_m1m3=n_clients,
+                    num_m2=m2_count,
+                    epochs=args.scaling_epochs,
+                    max_steps=args.scaling_steps,
+                    timeout=args.timeout,
+                    enable_gpu=args.enable_gpu,
+                )
+
+    plots_dir = parent_run_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "plot_paper_figures.py"),
+            "--runs-glob",
+            str(parent_run_dir / "*"),
+            "--out-dir",
+            str(plots_dir),
+            "--datasets",
+            args.datasets,
+            "--arches-split",
+            args.arches_split,
+        ],
+        cwd=REPO_ROOT,
+    )
+    print(f"[paper-v2] {parent_run_dir}", flush=True)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Paper experiments v2 (no PIR).")
+    parser.add_argument("--clients", type=int, default=1, help="Number of M1M3 clients.")
+    parser.add_argument("--m2", type=int, default=1, help="Number of M2 peers.")
+    parser.add_argument("--epochs", type=int, default=2, help="Epochs per run.")
+    parser.add_argument("--max-steps", type=int, default=0, help="Max steps per epoch (0 = full).")
+    parser.add_argument("--model", type=str, default="default", help="Model architecture.")
+    parser.add_argument("--pad", type=int, default=1024, help="Pad multiple.")
+    parser.add_argument("--timeout", type=int, default=0, help="Per-run timeout (seconds).")
+    parser.add_argument("--enable-gpu", action="store_true", help="Allow GPU usage during runs.")
+    parser.add_argument("--paper-name", type=str, default="", help="Parent folder name under runs/ (optional).")
+    parser.add_argument("--datasets", type=str, default="fashion-mnist", help="Datasets to run.")
+    parser.add_argument(
+        "--arches-split",
+        type=str,
+        default="vanilla-split,board-blind,double-blind",
+        help="Split architectures to include.",
+    )
+    parser.add_argument("--include-fed", action="store_true", help="Include federated run.")
+    parser.add_argument("--scaling-clients", type=str, default="1,2,4", help="Client counts for scaling.")
+    parser.add_argument("--scaling-m2", type=str, default="1,2", help="M2 counts for scaling.")
+    parser.add_argument("--scaling-epochs", type=int, default=1, help="Epochs for scaling runs.")
+    parser.add_argument("--scaling-steps", type=int, default=50, help="Steps per epoch for scaling runs.")
+    args = parser.parse_args()
+    main(args)

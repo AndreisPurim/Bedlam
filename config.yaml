@@ -1,0 +1,61 @@
+double_blind:
+  m1m3_count: 1
+  m2_count: 1
+federated:
+  local_epochs: 1
+  rounds: 5
+  server_name: fed_server
+general:
+  architecture: board-blind
+  batch_size: 128
+  board_host: 127.0.0.1
+  board_log_every: 100
+  board_port: 50051
+  board_verbose: true
+  bucket_namespace_mode: global
+  dataset: fashion-mnist
+  dummy_message_rate: 0.0
+  enable_perf_metrics: true
+  epochs: 2
+  hide_sender: false
+  key_rotation_grace: 1
+  key_rotation_seconds: 0
+  log_level: INFO
+  lr: 0.001
+  m1m3_log_every: 50
+  m1m3_verbose: true
+  m2_batch_delay_ms: 0
+  m2_log_every: 50
+  m2_max_messages_per_poll: 0
+  m2_verbose: true
+  max_steps_per_epoch: 0
+  model_architecture: default
+  pad_multiple: 1024
+  pairing_host: 127.0.0.1
+  pairing_port: 0
+  pir_chunk_size: 32
+  pir_clue_limit: 0
+  poll_jitter_ms: 0
+  poll_shuffle: false
+  pool_audience_clients: to_clients
+  pool_audience_m2: to_m2
+  pseudonym_scope: per_session
+  random_seed: 42
+  replay_cache_size: 10000
+  replay_future_ms: 60000
+  replay_protection: true
+  replay_window_ms: 300000
+  send_jitter_ms: 0
+  suppress_warnings: true
+  use_pir: false
+peers:
+  M1M3:
+  - name: client_1
+    target_m2: m2_1
+  M2:
+  - key: secret_key_1
+    name: m2_1
+random_seed: 42
+run:
+  base_dir: /home/andrejs/Bedlam/runs/paper_v2_1775270170
+  name: paper_v2_board-blind_fashion-mnist_default_p1m2_1_1775270260

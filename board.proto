@@ -1,0 +1,150 @@
+syntax = "proto3";
+
+package board;
+
+message PostMessageRequest {
+  string sender = 1;
+  string receiver = 2;
+  bytes payload = 3;
+  string audience = 4; // optional: use for pooled delivery instead of receiver
+}
+
+message PostMessageResponse {
+  string msg_id = 1;
+}
+
+message PollMessageRequest {
+  string receiver = 1;
+}
+
+message Message {
+  string msg_id = 1;
+  string sender = 2;
+  string receiver = 3;
+  bytes payload = 4;
+  int64 timestamp_ms = 5;
+}
+
+message PollMessageResponse {
+  bool has_message = 1;
+  Message message = 2;
+}
+
+message PollPoolRequest {
+  string audience = 1; // e.g., "to_m2" or "to_clients"
+}
+
+message PollPoolResponse {
+  repeated Message messages = 1;
+}
+
+message AckMessageRequest {
+  string msg_id = 1;
+  string audience = 2;
+}
+
+message AckMessageResponse {
+  bool removed = 1;
+}
+
+// ===== Bucket mode messages =====
+message CreateBucketRequest {
+  bytes payload = 1;
+  string namespace = 2; // optional logical namespace for filtering/sharding
+}
+
+message CreateBucketResponse {
+  string bucket_id = 1;
+}
+
+message Bucket {
+  string bucket_id = 1;
+  bytes payload = 2;
+  int64 timestamp_ms = 3;
+  string namespace = 4;
+}
+
+message PollBucketsRequest {
+  string namespace = 1; // optional namespace filter
+}
+
+message PollBucketsResponse {
+  repeated Bucket buckets = 1;
+}
+
+message UpdateBucketRequest {
+  string bucket_id = 1;
+  bytes payload = 2;
+}
+
+message UpdateBucketResponse {
+  bool updated = 1;
+}
+
+message AckBucketRequest {
+  string bucket_id = 1;
+}
+
+message AckBucketResponse {
+  bool removed = 1;
+}
+
+// ===== PIR mode messages =====
+message PIRPostRequest {
+  bytes payload = 1;
+  bytes clue = 2;
+}
+
+message PIRPostResponse {
+  uint64 index = 1;
+  uint64 total = 2;
+}
+
+message PIRCluesRequest {
+  uint64 start_index = 1;
+  uint32 limit = 2;
+}
+
+message PIRClue {
+  uint64 index = 1;
+  bytes clue = 2;
+  uint32 payload_len = 3;
+}
+
+message PIRCluesResponse {
+  repeated PIRClue clues = 1;
+  uint64 latest_index = 2;
+  uint64 total = 3;
+}
+
+message PIRQueryRequest {
+  bytes public_key = 1;
+  repeated bytes enc_selector = 2;
+  uint32 chunk_size = 3;
+}
+
+message PIRQueryResponse {
+  repeated bytes enc_chunks = 1;
+  uint32 record_len = 2;
+  uint64 total = 3;
+}
+
+service BoardService {
+  rpc PostMessage(PostMessageRequest) returns (PostMessageResponse);
+  rpc PollMessage(PollMessageRequest) returns (PollMessageResponse);
+  rpc PollPool(PollPoolRequest) returns (PollPoolResponse);
+  rpc AckMessage(AckMessageRequest) returns (AckMessageResponse);
+}
+
+service BucketBoard {
+  rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
+  rpc PollBuckets(PollBucketsRequest) returns (PollBucketsResponse);
+  rpc UpdateBucket(UpdateBucketRequest) returns (UpdateBucketResponse);
+  rpc AckBucket(AckBucketRequest) returns (AckBucketResponse);
+}
+
+service PIRService {
+  rpc PostPIRMessage(PIRPostRequest) returns (PIRPostResponse);
+  rpc GetClues(PIRCluesRequest) returns (PIRCluesResponse);
+  rpc PIRQuery(PIRQueryRequest) returns (PIRQueryResponse);
+}

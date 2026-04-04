@@ -1,0 +1,6 @@
+__pycache__/*
+*/__pycache__/*
+runs/*
+*.png
+board_pb2.py
+board_pb2_grpc.py
